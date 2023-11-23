@@ -8,6 +8,7 @@
 #include <type_traits>  // for remove_reference<>::type
 
 #include <errno.h>
+#include <fcntl.h>  // for SEEK_END
 #include <stdarg.h>
 #include <stdio.h>   // for FILE, fprintf, fflush, fopen, fputs, fseek
 #include <string.h>  // for strchr, strcmp
@@ -151,7 +152,8 @@ void gjs_log_init() {
             GjsAutoStrv prefixes(g_strsplit(topics, ";", -1));
             for (unsigned i = 0; prefixes[i] != NULL; i++) {
                 GjsDebugTopic topic = prefix_to_topic(prefixes[i]);
-                s_enabled_topics[topic] = topic != GJS_DEBUG_LAST;
+                if (topic != GJS_DEBUG_LAST)
+                    s_enabled_topics[topic] = true;
             }
         }
     }
