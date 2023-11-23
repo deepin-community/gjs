@@ -1,3 +1,158 @@
+gjs (1.74.2-1+deb12u1) bookworm; urgency=medium
+
+  * d/p/function-Always-initialize-callback-return-value.patch:
+    Add patch backported from upstream 1.77.1 avoiding infinite loops
+    of idle callbacks if an idle handler is called during GC. The most
+    common reason for this is if a GNOME Shell extension incorrectly does
+    not disconnect all of its signal/idle/timeout handlers. This change
+    mitigates the infinite loop and associated log flooding, but does not
+    fix the extension behaviour. (Closes: #1034356)
+
+ -- Simon McVittie <smcv@debian.org>  Sat, 09 Sep 2023 20:29:21 +0100
+
+gjs (1.74.2-1) unstable; urgency=medium
+
+  * New upstream release
+  * debian/gbp.conf, debian/control.in: Branch for bookworm
+
+ -- Jeremy Bicha <jbicha@ubuntu.com>  Tue, 21 Feb 2023 07:13:29 -0500
+
+gjs (1.74.1-1) unstable; urgency=medium
+
+  * Team upload
+  * New upstream stable release
+  * Build-/test-depend on dbus-daemon instead of dbus.
+    This is sufficient to provide dbus-run-session.
+  * Update Lintian override syntax
+  * Set field Upstream-Name in debian/copyright
+  * Update standards version to 4.6.1 (no changes needed)
+  * d/upstream/metadata: Add
+  * d/watch, d/gbp.conf: Only watch for stable releases.
+    We'll follow 1.74.x for Debian 12.
+
+ -- Simon McVittie <smcv@debian.org>  Tue, 15 Nov 2022 09:03:01 +0000
+
+gjs (1.74.0-2) unstable; urgency=medium
+
+  * Release to unstable
+
+ -- Jeremy Bicha <jbicha@ubuntu.com>  Sat, 24 Sep 2022 23:34:26 -0400
+
+gjs (1.74.0-1) experimental; urgency=medium
+
+  * New upstream release
+
+ -- Jeremy Bicha <jbicha@ubuntu.com>  Wed, 21 Sep 2022 07:57:12 -0400
+
+gjs (1.73.2-1) experimental; urgency=medium
+
+  * New upstream release
+  * Build against mozjs102
+  * debian/libgjs0g.symbols: Add new symbol
+
+ -- Jeremy Bicha <jbicha@ubuntu.com>  Wed, 24 Aug 2022 14:43:34 -0400
+
+gjs (1.73.1-2) unstable; urgency=medium
+
+  * Rebuild against latest mozjs91 (Closes: #1017063)
+
+ -- Jeremy Bicha <jbicha@ubuntu.com>  Fri, 12 Aug 2022 21:33:27 -0400
+
+gjs (1.73.1-1) unstable; urgency=medium
+
+  * New upstream release
+  * debian/control.in: Bump minimum meson to 0.54.0
+
+ -- Jeremy Bicha <jbicha@ubuntu.com>  Wed, 03 Aug 2022 11:51:35 -0400
+
+gjs (1.72.0-4) unstable; urgency=medium
+
+  [ Simon McVittie ]
+  * d/copyright: Replace CC0-1.0 text with a reference to common-licenses
+
+  [ Jeremy Bicha ]
+  * Cherry-pick patch to fix memory leak seen when taking screenshots
+    (LP: #1973638)
+
+ -- Jeremy Bicha <jbicha@ubuntu.com>  Wed, 29 Jun 2022 08:40:12 -0400
+
+gjs (1.72.0-3) unstable; urgency=medium
+
+  * debian/patches: Correctly generate camelCase properties on all locales.
+    And particularly looking at Turkish one. (LP: #1969838)
+
+ -- Marco Trevisan (Treviño) <marco@ubuntu.com>  Thu, 28 Apr 2022 22:24:50 +0200
+
+gjs (1.72.0-2) unstable; urgency=medium
+
+  * Upload to unstable
+
+ -- Jeremy Bicha <jbicha@ubuntu.com>  Wed, 23 Mar 2022 10:48:56 -0400
+
+gjs (1.72.0-1) experimental; urgency=medium
+
+  * New upstream release
+
+ -- Jeremy Bicha <jbicha@ubuntu.com>  Tue, 22 Mar 2022 08:09:08 -0400
+
+gjs (1.71.90-1) experimental; urgency=medium
+
+  [ Jeremy Bicha ]
+  * New upstream release
+  * Drop all patches: applied in new release
+
+  [ Marco Trevisan (Treviño) ]
+  * debian/gjs.examples: Install JS examples
+  * debian/control: Use clearer short descriptions for packages
+  * debian/changelog: Remove trailing spaces
+  * debian/control: Remove libgjs-dev dependency on gjs
+  * debian/control: Remove duplicated build-dependency on libcairo2-dev
+  * debian/gjs-tests.lintian-overrides: Ignore link error on d'loaded libs
+
+ -- Jeremy Bicha <jeremy.bicha@canonical.com>  Tue, 08 Mar 2022 15:37:21 -0500
+
+gjs (1.71.1-1) experimental; urgency=medium
+
+  * New upstream release:
+    - New JavaScript features! This version of GJS is based on SpiderMonkey 91
+      For more information, look them up on MDN or devdocs.io
+    - It's now possible to pass BigInt values to GObject-introspected functions
+      with 64-bit parameters
+  * debian/patches: Cherry-pick upstream test fixes
+  * debian/patches: Do not crash on instanceof checks on interfaces
+    (LP: #1960898)
+  * debian/patches: Correctly handle later handled promises rejections
+  * debian/control: Bump dependency on mozjs-91
+  * debian/libgjs0g.symbols: Include new symbols
+
+ -- Marco Trevisan (Treviño) <marco@ubuntu.com>  Tue, 22 Feb 2022 12:26:43 +0100
+
+gjs (1.70.1-1) unstable; urgency=medium
+
+  * New upstream release
+  * Drop all patches: applied in new release
+
+ -- Jeremy Bicha <jeremy.bicha@canonical.com>  Tue, 08 Feb 2022 08:38:53 -0500
+
+gjs (1.70.0-4) unstable; urgency=medium
+
+  * Team upload
+  * d/p/arg-Replace-gsize-with-size_t.patch,
+    d/p/Handle-optional-out-parameters-in-callbacks.patch:
+    Include all patches from upstream gnome-41 branch up to
+    1.70.0-4-g62025d4a2
+    - Fix FTBFS on some 32-bit architectures where size_t is unsigned long
+      but gsize is unsigned int
+    - Allow optional 'out' parameters in callbacks to be NULL
+  * d/p/build-disable-gir-install-via-list-to-pacify-meson-0.60.2.patch:
+    Add patch from upstream to fix FTBFS with meson 0.60.2 (Closes: #1002101)
+  * d/p/installed-tests-Install-matchers.js.patch:
+    Make cosmetic changes to match the version applied upstream
+  * d/p/build-Link-with-libatomic-if-necessary.patch:
+    Mark as applied upstream
+
+ -- Simon McVittie <smcv@debian.org>  Tue, 21 Dec 2021 19:39:35 +0000
+
 gjs (1.70.0-3) unstable; urgency=medium
 
   * Team upload
@@ -424,8 +579,8 @@ gjs (1.58.0-1) experimental; urgency=medium
 
   * New upstream release
   * d/control: update build-dep on gobject-introspection to 1.61.2
-  * d/rules: --with-xvfb-tests option has been removed 
-  * d/test.sh: call xvfb-run from the test wrapper to start a server 
+  * d/rules: --with-xvfb-tests option has been removed
+  * d/test.sh: call xvfb-run from the test wrapper to start a server
   * d/control: build-dep on xauth for xvfb-run
 
  -- Tim Lunn <tim@feathertop.org>  Wed, 11 Sep 2019 22:02:08 +1000
@@ -433,7 +588,7 @@ gjs (1.58.0-1) experimental; urgency=medium
 gjs (1.57.91-2) experimental; urgency=medium
 
   * fix up depends so autopkgtests pass again
-  - debian/control: 
+  - debian/control:
       - depend on libcairo2-dev, this was implicitly pulled by libgtk3 before
       - runtime depend on gir1.2-gtk-3.0
 
@@ -584,7 +739,7 @@ gjs (1.52.3-2) unstable; urgency=medium
 
 gjs (1.52.3-1) unstable; urgency=medium
 
-  * New upstream release 
+  * New upstream release
 
  -- Tim Lunn <tim@feathertop.org>  Tue, 08 May 2018 17:18:07 +1000
 
@@ -596,7 +751,7 @@ gjs (1.52.2-1) unstable; urgency=medium
 
 gjs (1.52.1-1) unstable; urgency=medium
 
-  * New upstream release 
+  * New upstream release
   * Drop patch included in new release
 
  -- Tim Lunn <tim@feathertop.org>  Thu, 12 Apr 2018 18:12:07 +1000
