@@ -16,11 +16,12 @@
 #    include <stdint.h>
 #    include <stdio.h>      // for sscanf
 #    include <string.h>     // for memcpy, strlen
-#    include <syscall.h>    // for __NR_gettid
-#    include <time.h>       // for size_t, CLOCK_MONOTONIC, itimerspec, ...
+#    include <sys/syscall.h>  // for __NR_gettid
+#    include <time.h>         // for size_t, CLOCK_MONOTONIC, itimerspec, ...
 #    ifdef HAVE_UNISTD_H
 #        include <unistd.h>  // for getpid, syscall
 #    endif
+#    include <array>
 #    ifdef G_OS_UNIX
 #        include <glib-unix.h>
 #    endif
@@ -48,7 +49,7 @@
  * However, we do use a Linux'ism that allows us to deliver the signal
  * to only a single thread. Doing this in a generic fashion would
  * require thread-registration so that we can mask SIGPROF from all
- * threads execpt the JS thread. The gecko engine uses tgkill() to do
+ * threads except the JS thread. The gecko engine uses tgkill() to do
  * this with a secondary thread instead of using POSIX timers. We could
  * do this too, but it would still be Linux-only.
  *
@@ -88,6 +89,10 @@ struct _GjsProfiler {
     GSource* periodic_flush;
 
     SysprofCaptureWriter* target_capture;
+
+    // Cache previous values of counters so that we don't overrun the output
+    // with counters that don't change very often
+    uint64_t last_counter_values[GJS_N_COUNTERS];
 #endif  /* ENABLE_PROFILER */
 
     /* The filename to write to */
@@ -185,7 +190,7 @@ static void setup_counter_helper(SysprofCaptureCounter* counter,
 
     g_assert(self && "Profiler must be set up before defining counters");
 
-    SysprofCaptureCounter counters[GJS_N_COUNTERS];
+    std::array<SysprofCaptureCounter, GJS_N_COUNTERS> counters;
     self->counter_base =
         sysprof_capture_writer_request_counter(self->capture, GJS_N_COUNTERS);
 
@@ -196,10 +201,10 @@ static void setup_counter_helper(SysprofCaptureCounter* counter,
 #    undef SETUP_COUNTER
 
     if (!sysprof_capture_writer_define_counters(
-            self->capture, now, -1, self->pid, counters, GJS_N_COUNTERS))
+            self->capture, now, -1, self->pid, counters.data(), GJS_N_COUNTERS))
         return false;
 
-    SysprofCaptureCounter gc_counters[Gjs::GCCounters::N_COUNTERS];
+    std::array<SysprofCaptureCounter, Gjs::GCCounters::N_COUNTERS> gc_counters;
     self->gc_counter_base = sysprof_capture_writer_request_counter(
         self->capture, Gjs::GCCounters::N_COUNTERS);
 
@@ -223,7 +228,7 @@ static void setup_counter_helper(SysprofCaptureCounter* counter,
                description_size, "Malloc bytes owned by tenured GC things");
 
     return sysprof_capture_writer_define_counters(self->capture, now, -1,
-                                                  self->pid, gc_counters,
+                                                  self->pid, gc_counters.data(),
                                                   Gjs::GCCounters::N_COUNTERS);
 }
 
@@ -434,15 +439,24 @@ static void gjs_profiler_sigprof(int signum [[maybe_unused]], siginfo_t* info,
 
     unsigned ids[GJS_N_COUNTERS];
     SysprofCaptureCounterValue values[GJS_N_COUNTERS];
+    size_t new_counts = 0;
 
-#    define FETCH_COUNTERS(name, ix)       \
-        ids[ix] = self->counter_base + ix; \
-        values[ix].v64 = GJS_GET_COUNTER(name);
+#    define FETCH_COUNTERS(name, ix)                       \
+        {                                                  \
+            uint64_t count = GJS_GET_COUNTER(name);        \
+            if (count != self->last_counter_values[ix]) {  \
+                ids[new_counts] = self->counter_base + ix; \
+                values[new_counts].v64 = count;            \
+                new_counts++;                              \
+            }                                              \
+            self->last_counter_values[ix] = count;         \
+        }
     GJS_FOR_EACH_COUNTER(FETCH_COUNTERS);
 #    undef FETCH_COUNTERS
 
-    if (!sysprof_capture_writer_set_counters(self->capture, now, -1, self->pid,
-                                             ids, values, GJS_N_COUNTERS))
+    if (new_counts > 0 &&
+        !sysprof_capture_writer_set_counters(self->capture, now, -1, self->pid,
+                                             ids, values, new_counts))
         gjs_profiler_stop(self);
 }
 
@@ -652,7 +666,7 @@ gjs_profiler_stop(GjsProfiler *self)
 static gboolean
 gjs_profiler_sigusr2(void *data)
 {
-    auto context = static_cast<GjsContext *>(data);
+    GjsContext* context = GJS_CONTEXT(data);
     GjsProfiler *current_profiler = gjs_context_get_profiler(context);
 
     if (current_profiler) {

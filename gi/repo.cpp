@@ -4,7 +4,6 @@
 
 #include <config.h>
 
-#include <stdint.h>
 #include <string.h>  // for strlen
 
 #if GJS_VERBOSE_ENABLE_GI_USAGE
@@ -83,8 +82,6 @@ GJS_JSAPI_RETURN_CONVENTION
 static bool resolve_namespace_object(JSContext* context,
                                      JS::HandleObject repo_obj,
                                      JS::HandleId ns_id) {
-    GError *error;
-
     JS::UniqueChars version;
     if (!get_version_for_ns(context, repo_obj, ns_id, &version))
         return false;
@@ -108,14 +105,33 @@ static bool resolve_namespace_object(JSContext* context,
                       ns_name.get(), nversions))
         return false;
 
-    error = NULL;
+    GjsAutoError error;
+    // If resolving Gio, load the platform-specific typelib first, so that
+    // GioUnix/GioWin32 GTypes get looked up in there with higher priority,
+    // instead of in Gio.
+#if GLIB_CHECK_VERSION(2, 79, 2) && (defined(G_OS_UNIX) || defined(G_OS_WIN32))
+    if (strcmp(ns_name.get(), "Gio") == 0) {
+#    ifdef G_OS_UNIX
+        const char* platform = "Unix";
+#    else   // G_OS_WIN32
+        const char* platform = "Win32";
+#    endif  // G_OS_UNIX/G_OS_WIN32
+        GjsAutoChar platform_specific =
+            g_strconcat(ns_name.get(), platform, nullptr);
+        if (!g_irepository_require(nullptr, platform_specific, version.get(),
+                                   GIRepositoryLoadFlags(0), &error)) {
+            gjs_throw(context, "Failed to require %s %s: %s",
+                      platform_specific.get(), version.get(), error->message);
+            return false;
+        }
+    }
+#endif  // GLib >= 2.79.2
+
     g_irepository_require(nullptr, ns_name.get(), version.get(),
                           GIRepositoryLoadFlags(0), &error);
-    if (error != NULL) {
+    if (error) {
         gjs_throw(context, "Requiring %s, version %s: %s", ns_name.get(),
                   version ? version.get() : "none", error->message);
-
-        g_error_free(error);
         return false;
     }
 
@@ -126,14 +142,14 @@ static bool resolve_namespace_object(JSContext* context,
     JS::RootedObject gi_namespace(context,
                                   gjs_create_ns(context, ns_name.get()));
 
+    JS::RootedValue override(context);
+    if (!lookup_override_function(context, ns_id, &override))
+        return false;
+
     /* Define the property early, to avoid reentrancy issues if
        the override module looks for namespaces that import this */
     if (!JS_DefinePropertyById(context, repo_obj, ns_id, gi_namespace,
                                GJS_MODULE_PROP_FLAGS))
-        return false;
-
-    JS::RootedValue override(context);
-    if (!lookup_override_function(context, ns_id, &override))
         return false;
 
     JS::RootedValue result(context);
@@ -230,6 +246,22 @@ repo_new(JSContext *context)
                                JSPROP_PERMANENT))
         return nullptr;
 
+#if GLIB_CHECK_VERSION(2, 79, 2)
+#    if defined(G_OS_UNIX)
+    if (!JS_DefineProperty(context, versions, "GLibUnix", two_point_oh,
+                           JSPROP_PERMANENT) ||
+        !JS_DefineProperty(context, versions, "GioUnix", two_point_oh,
+                           JSPROP_PERMANENT))
+        return nullptr;
+#    elif defined(G_OS_WIN32)
+    if (!JS_DefineProperty(context, versions, "GLibWin32", two_point_oh,
+                           JSPROP_PERMANENT) ||
+        !JS_DefineProperty(context, versions, "GioWin32", two_point_oh,
+                           JSPROP_PERMANENT))
+        return nullptr;
+#    endif  // G_OS_UNIX/G_OS_WIN32
+#endif      // GLib >= 2.79.2
+
     JS::RootedObject private_ns(context, JS_NewPlainObject(context));
     if (!JS_DefinePropertyById(context, repo, atoms.private_ns_marker(),
                                private_ns, JSPROP_PERMANENT | JSPROP_RESOLVING))
@@ -254,7 +286,7 @@ static bool gjs_value_from_constant_info(JSContext* cx, GIConstantInfo* info,
 
     GjsAutoTypeInfo type_info = g_constant_info_get_type(info);
 
-    bool ok = gjs_value_from_g_argument(cx, value, type_info, &garg, true);
+    bool ok = gjs_value_from_gi_argument(cx, value, type_info, &garg, true);
 
     g_constant_info_free_value(info, &garg);
     return ok;
@@ -407,7 +439,8 @@ gjs_define_info(JSContext       *context,
             return false;
         break;
     case GI_INFO_TYPE_UNION:
-        if (!gjs_define_union_class(context, in_object, (GIUnionInfo*) info))
+        if (!UnionPrototype::define_class(context, in_object,
+                                          (GIUnionInfo*)info))
             return false;
         break;
     case GI_INFO_TYPE_ENUM:
@@ -490,31 +523,23 @@ gjs_lookup_namespace_object(JSContext  *context,
     return gjs_lookup_namespace_object_by_name(context, ns_name);
 }
 
-/* Check if an exception's 'name' property is equal to compare_name. Ignores
+/* Check if an exception's 'name' property is equal to ImportError. Ignores
  * all errors that might arise. */
-[[nodiscard]] static bool error_has_name(JSContext* cx,
-                                         JS::HandleValue thrown_value,
-                                         JSString* compare_name) {
+[[nodiscard]] static bool is_import_error(JSContext* cx,
+                                          JS::HandleValue thrown_value) {
     if (!thrown_value.isObject())
         return false;
 
     JS::AutoSaveExceptionState saved_exc(cx);
     JS::RootedObject exc(cx, &thrown_value.toObject());
     JS::RootedValue exc_name(cx);
-    bool retval = false;
     const GjsAtoms& atoms = GjsContextPrivate::atoms(cx);
+    bool eq;
+    bool retval =
+        JS_GetPropertyById(cx, exc, atoms.name(), &exc_name) &&
+        JS_StringEqualsLiteral(cx, exc_name.toString(), "ImportError", &eq) &&
+        eq;
 
-    if (!JS_GetPropertyById(cx, exc, atoms.name(), &exc_name))
-        goto out;
-
-    int32_t cmp_result;
-    if (!JS_CompareStrings(cx, exc_name.toString(), compare_name, &cmp_result))
-        goto out;
-
-    if (cmp_result == 0)
-        retval = true;
-
-out:
     saved_exc.restore();
     return retval;
 }
@@ -527,7 +552,7 @@ lookup_override_function(JSContext             *cx,
 {
     JS::AutoSaveExceptionState saved_exc(cx);
 
-    JS::RootedObject global(cx, gjs_get_import_global(cx));
+    JS::RootedObject global{cx, JS::CurrentGlobalOrNull(cx)};
     JS::RootedValue importer(
         cx, gjs_get_global_slot(global, GjsGlobalSlot::IMPORTS));
     g_assert(importer.isObject());
@@ -537,7 +562,7 @@ lookup_override_function(JSContext             *cx,
     const GjsAtoms& atoms = GjsContextPrivate::atoms(cx);
     if (!gjs_object_require_property(cx, importer_obj, "importer",
                                      atoms.overrides(), &overridespkg))
-        goto fail;
+        return false;
 
     if (!gjs_object_require_property(cx, overridespkg,
                                      "GI repository object", ns_name,
@@ -547,25 +572,24 @@ lookup_override_function(JSContext             *cx,
 
         /* If the exception was an ImportError (i.e., module not found) then
          * we simply didn't have an override, don't throw an exception */
-        if (error_has_name(cx, exc, JS_AtomizeAndPinString(cx, "ImportError"))) {
+        if (is_import_error(cx, exc)) {
             saved_exc.restore();
             return true;
         }
 
-        goto fail;
+        return false;
     }
 
+    // If the override module is present, it must have a callable _init(). An
+    // override module without _init() is probably unintentional. (function
+    // being undefined means there was no override module.)
     if (!gjs_object_require_property(cx, module, "override module",
                                      atoms.init(), function) ||
-        !function.isObjectOrNull()) {
+        !function.isObject() || !JS::IsCallable(&function.toObject())) {
         gjs_throw(cx, "Unexpected value for _init in overrides module");
-        goto fail;
+        return false;
     }
     return true;
-
-fail:
-    saved_exc.drop();
-    return false;
 }
 
 GJS_JSAPI_RETURN_CONVENTION
@@ -675,11 +699,9 @@ JSObject *
 gjs_lookup_generic_constructor(JSContext  *context,
                                GIBaseInfo *info)
 {
-    const char *constructor_name;
-
-    JS::RootedObject in_object(context,
-        gjs_lookup_namespace_object(context, (GIBaseInfo*) info));
-    constructor_name = g_base_info_get_name((GIBaseInfo*) info);
+    JS::RootedObject in_object{context,
+        gjs_lookup_namespace_object(context, info)};
+    const char* constructor_name = g_base_info_get_name(info);
 
     if (G_UNLIKELY (!in_object))
         return NULL;

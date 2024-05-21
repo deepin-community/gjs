@@ -6,8 +6,9 @@
 
 #include <signal.h>  // for sigaction, SIGUSR1, sa_handler
 #include <stdint.h>
-#include <stdio.h>      // for FILE, fclose, size_t
-#include <string.h>     // for memset
+#include <stdio.h>   // for FILE, fclose, size_t
+#include <stdlib.h>  // for exit
+#include <string.h>  // for memset
 
 #ifdef HAVE_UNISTD_H
 #    include <unistd.h>  // for getpid
@@ -18,7 +19,6 @@
 #ifdef DEBUG
 #    include <algorithm>  // for find
 #endif
-#include <atomic>
 #include <new>
 #include <string>       // for u16string
 #include <thread>       // for get_id
@@ -48,6 +48,7 @@
 #include <js/GCHashTable.h>         // for WeakCache
 #include <js/GCVector.h>            // for RootedVector
 #include <js/GlobalObject.h>        // for CurrentGlobalOrNull
+#include <js/HeapAPI.h>             // for ExposeObjectToActiveJS
 #include <js/Id.h>
 #include <js/Modules.h>
 #include <js/Promise.h>             // for JobQueue::SavedJobQueue
@@ -60,12 +61,13 @@
 #include <js/TracingAPI.h>
 #include <js/TypeDecls.h>
 #include <js/UniquePtr.h>
+#include <js/Utility.h>  // for DeletePolicy via WeakCache
 #include <js/Value.h>
 #include <js/ValueArray.h>
 #include <js/friend/DumpFunctions.h>
 #include <jsapi.h>        // for JS_GetFunctionObject, JS_Ge...
 #include <jsfriendapi.h>  // for ScriptEnvironmentPreparer
-#include <mozilla/UniquePtr.h>
+#include <mozilla/UniquePtr.h>  // for UniquePtr::get
 
 #include "gi/closure.h"  // for Closure::Ptr, Closure
 #include "gi/function.h"
@@ -92,8 +94,13 @@
 #include "gjs/profiler.h"
 #include "gjs/promise.h"
 #include "gjs/text-encoding.h"
-#include "modules/modules.h"
+#include "modules/console.h"
+#include "modules/print.h"
+#include "modules/system.h"
 #include "util/log.h"
+#ifdef ENABLE_CAIRO
+#    include "modules/cairo-module.h"
+#endif
 
 namespace mozilla {
 union Utf8Unit;
@@ -124,13 +131,7 @@ struct _GjsContext {
     GObject parent;
 };
 
-struct _GjsContextClass {
-    GObjectClass parent;
-};
-
 G_DEFINE_TYPE_WITH_PRIVATE(GjsContext, gjs_context, G_TYPE_OBJECT);
-
-Gjs::NativeModuleRegistry& registry = Gjs::NativeModuleRegistry::get();
 
 GjsContextPrivate* GjsContextPrivate::from_object(GObject* js_context) {
     g_return_val_if_fail(GJS_IS_CONTEXT(js_context), nullptr);
@@ -339,13 +340,18 @@ gjs_context_class_init(GjsContextClass *klass)
 #endif
         g_irepository_prepend_search_path(priv_typelib_dir);
     }
+    auto& registry = Gjs::NativeModuleDefineFuncs::get();
     registry.add("_promiseNative", gjs_define_native_promise_stuff);
     registry.add("_byteArrayNative", gjs_define_byte_array_stuff);
     registry.add("_encodingNative", gjs_define_text_encoding_stuff);
     registry.add("_gi", gjs_define_private_gi_stuff);
     registry.add("gi", gjs_define_repo);
-
-    gjs_register_static_modules();
+#ifdef ENABLE_CAIRO
+    registry.add("cairoNative", gjs_js_define_cairo_stuff);
+#endif
+    registry.add("system", gjs_js_define_system_stuff);
+    registry.add("console", gjs_define_console_stuff);
+    registry.add("_print", gjs_define_print_stuff);
 }
 
 void GjsContextPrivate::trace(JSTracer* trc, void* data) {
@@ -353,14 +359,16 @@ void GjsContextPrivate::trace(JSTracer* trc, void* data) {
     JS::TraceEdge<JSObject*>(trc, &gjs->m_global, "GJS global object");
     JS::TraceEdge<JSObject*>(trc, &gjs->m_internal_global,
                              "GJS internal global object");
+    JS::TraceEdge<JSObject*>(trc, &gjs->m_main_loop_hook, "GJS main loop hook");
     gjs->m_atoms->trace(trc);
     gjs->m_job_queue.trace(trc);
+    gjs->m_cleanup_tasks.trace(trc);
     gjs->m_object_init_list.trace(trc);
 }
 
 void GjsContextPrivate::warn_about_unhandled_promise_rejections(void) {
     for (auto& kv : m_unhandled_rejection_stacks) {
-        const char *stack = kv.second;
+        const char* stack = kv.second.get();
         g_warning("Unhandled promise rejection. To suppress this warning, add "
                   "an error handler to your promise chain with .catch() or a "
                   "try-catch block around your await expression. %s%s",
@@ -464,11 +472,15 @@ void GjsContextPrivate::dispose(void) {
         JS_RemoveExtraGCRootsTracer(m_cx, &GjsContextPrivate::trace, this);
         m_global = nullptr;
         m_internal_global = nullptr;
+        m_main_loop_hook = nullptr;
 
         gjs_debug(GJS_DEBUG_CONTEXT, "Freeing allocated resources");
         delete m_fundamental_table;
         delete m_gtype_table;
         delete m_atoms;
+
+        m_job_queue.clear();
+        m_object_init_list.clear();
 
         /* Tear down JS */
         JS_DestroyContext(m_cx);
@@ -530,6 +542,12 @@ static bool on_context_module_rejected_log_exception(JSContext* cx,
                                                      unsigned argc,
                                                      JS::Value* vp) {
     JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+
+    JSString* id =
+        JS_GetFunctionDisplayId(JS_GetObjectFunction(&args.callee()));
+    gjs_debug(GJS_DEBUG_IMPORTER, "Module evaluation promise rejected: %s",
+              gjs_debug_string(id).c_str());
+
     JS::HandleValue error = args.get(0);
 
     GjsContextPrivate* gjs_cx = GjsContextPrivate::from_cx(cx);
@@ -546,6 +564,12 @@ static bool on_context_module_rejected_log_exception(JSContext* cx,
 static bool on_context_module_resolved(JSContext* cx, unsigned argc,
                                        JS::Value* vp) {
     JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+
+    JSString* id =
+        JS_GetFunctionDisplayId(JS_GetObjectFunction(&args.callee()));
+    gjs_debug(GJS_DEBUG_IMPORTER, "Module evaluation promise resolved: %s",
+              gjs_debug_string(id).c_str());
+
     args.rval().setUndefined();
 
     GjsContextPrivate::from_cx(cx)->main_loop_release();
@@ -564,12 +588,12 @@ static bool add_promise_reactions(JSContext* cx, JS::HandleValue promise,
 
     JS::RootedFunction on_rejected(
         cx,
-        js::NewFunctionWithReserved(cx, reject, 1, 0, resolved_tag.c_str()));
+        js::NewFunctionWithReserved(cx, reject, 1, 0, rejected_tag.c_str()));
     if (!on_rejected)
         return false;
     JS::RootedFunction on_resolved(
         cx,
-        js::NewFunctionWithReserved(cx, resolve, 1, 0, rejected_tag.c_str()));
+        js::NewFunctionWithReserved(cx, resolve, 1, 0, resolved_tag.c_str()));
     if (!on_resolved)
         return false;
 
@@ -588,7 +612,7 @@ static void load_context_module(JSContext* cx, const char* uri,
         g_error("Failed to load %s module.", debug_identifier);
     }
 
-    if (!JS::ModuleInstantiate(cx, loader)) {
+    if (!JS::ModuleLink(cx, loader)) {
         gjs_log_exception(cx);
         g_error("Failed to instantiate %s module.", debug_identifier);
     }
@@ -605,6 +629,12 @@ static void load_context_module(JSContext* cx, const char* uri,
         [](JSContext* cx, unsigned argc, JS::Value* vp) {
             JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
 
+            JSString* id =
+                JS_GetFunctionDisplayId(JS_GetObjectFunction(&args.callee()));
+            gjs_debug(GJS_DEBUG_IMPORTER,
+                      "Module evaluation promise rejected: %s",
+                      gjs_debug_string(id).c_str());
+
             JS::HandleValue error = args.get(0);
             // Abort because this module is required.
             gjs_log_exception_full(cx, error, nullptr, G_LOG_LEVEL_ERROR);
@@ -612,7 +642,7 @@ static void load_context_module(JSContext* cx, const char* uri,
             GjsContextPrivate::from_cx(cx)->main_loop_release();
             return false;
         },
-        "context");
+        debug_identifier);
 
     if (!ok) {
         gjs_log_exception(cx);
@@ -625,6 +655,7 @@ GjsContextPrivate::GjsContextPrivate(JSContext* cx, GjsContext* public_context)
       m_cx(cx),
       m_owner_thread(std::this_thread::get_id()),
       m_dispatcher(this),
+      m_memory_monitor(g_memory_monitor_dup_default()),
       m_environment_preparer(cx) {
     JS_SetGCCallback(
         cx,
@@ -666,9 +697,8 @@ GjsContextPrivate::GjsContextPrivate(JSContext* cx, GjsContext* public_context)
         g_error("Failed to initialize internal global object");
     }
 
-    JSAutoRealm ar(m_cx, internal_global);
-
     m_internal_global = internal_global;
+    Gjs::AutoInternalRealm ar{this};
     JS_AddExtraGCRootsTracer(m_cx, &GjsContextPrivate::trace, this);
 
     if (!m_atoms->init_atoms(m_cx)) {
@@ -695,7 +725,7 @@ GjsContextPrivate::GjsContextPrivate(JSContext* cx, GjsContext* public_context)
     m_global = global;
 
     {
-        JSAutoRealm ar(cx, global);
+        Gjs::AutoMainRealm ar{this};
 
         std::vector<std::string> paths;
         if (m_search_path)
@@ -737,7 +767,7 @@ GjsContextPrivate::GjsContextPrivate(JSContext* cx, GjsContext* public_context)
     }
 
     {
-        JSAutoRealm ar(cx, global);
+        Gjs::AutoMainRealm ar{this};
         load_context_module(
             cx, "resource:///org/gnome/gjs/modules/esm/_bootstrap/default.js",
             "ESM bootstrap");
@@ -745,6 +775,19 @@ GjsContextPrivate::GjsContextPrivate(JSContext* cx, GjsContext* public_context)
 
     [[maybe_unused]] bool success = m_main_loop.spin(this);
     g_assert(success && "bootstrap should not call system.exit()");
+
+    g_signal_connect_object(
+        m_memory_monitor, "low-memory-warning",
+        G_CALLBACK(+[](GjsContext* js_cx, GMemoryMonitorWarningLevel level) {
+            auto* cx =
+                static_cast<JSContext*>(gjs_context_get_native_context(js_cx));
+            JS::PrepareForFullGC(cx);
+            JS::GCOptions gc_strength = JS::GCOptions::Normal;
+            if (level > G_MEMORY_MONITOR_WARNING_LEVEL_LOW)
+                gc_strength = JS::GCOptions::Shrink;
+            JS::NonIncrementalGC(cx, gc_strength, Gjs::GCReason::LOW_MEMORY);
+        }),
+        m_public_context, G_CONNECT_SWAPPED);
 
     start_draining_job_queue();
 }
@@ -853,6 +896,11 @@ void GjsContextPrivate::schedule_gc_internal(bool force_gc) {
     m_auto_gc_id = g_timeout_add_seconds_full(G_PRIORITY_LOW, 10,
                                               trigger_gc_if_needed, this,
                                               nullptr);
+
+    if (force_gc)
+        g_source_set_name_by_id(m_auto_gc_id, "[gjs] Garbage Collection (Big Hammer)");
+    else
+        g_source_set_name_by_id(m_auto_gc_id, "[gjs] Garbage Collection");
 }
 
 /*
@@ -987,15 +1035,16 @@ bool GjsContextPrivate::should_exit(uint8_t* exit_code_p) const {
     return m_should_exit;
 }
 
-void GjsContextPrivate::start_draining_job_queue(void) {
-    gjs_debug(GJS_DEBUG_CONTEXT, "Starting promise job dispatcher");
-    m_dispatcher.start();
+void GjsContextPrivate::exit_immediately(uint8_t exit_code) {
+    warn_about_unhandled_promise_rejections();
+
+    ::exit(exit_code);
 }
+
+void GjsContextPrivate::start_draining_job_queue(void) { m_dispatcher.start(); }
 
 void GjsContextPrivate::stop_draining_job_queue(void) {
     m_draining_job_queue = false;
-
-    gjs_debug(GJS_DEBUG_CONTEXT, "Stopping promise job dispatcher");
     m_dispatcher.stop();
 }
 
@@ -1014,7 +1063,7 @@ bool GjsContextPrivate::enqueuePromiseJob(JSContext* cx [[maybe_unused]],
     g_assert(cx == m_cx);
     g_assert(from_cx(cx) == this);
 
-    gjs_debug(GJS_DEBUG_CONTEXT,
+    gjs_debug(GJS_DEBUG_MAINLOOP,
               "Enqueue job %s, promise=%s, allocation site=%s",
               gjs_debug_object(job).c_str(), gjs_debug_object(promise).c_str(),
               gjs_debug_object(allocation_site).c_str());
@@ -1031,12 +1080,10 @@ bool GjsContextPrivate::enqueuePromiseJob(JSContext* cx [[maybe_unused]],
 
 // Override of JobQueue::runJobs(). Called by js::RunJobs(), and when execution
 // of the job queue was interrupted by the debugger and is resuming.
-void GjsContextPrivate::runJobs(JSContext* cx) { runJobs(cx, nullptr); }
-
-void GjsContextPrivate::runJobs(JSContext* cx, GCancellable* cancellable) {
+void GjsContextPrivate::runJobs(JSContext* cx) {
     g_assert(cx == m_cx);
     g_assert(from_cx(cx) == this);
-    if (!run_jobs_fallible(cancellable))
+    if (!run_jobs_fallible())
         gjs_log_exception(cx);
 }
 
@@ -1052,7 +1099,7 @@ void GjsContextPrivate::runJobs(JSContext* cx, GCancellable* cancellable) {
  * Returns: false if one of the jobs threw an uncatchable exception;
  * otherwise true.
  */
-bool GjsContextPrivate::run_jobs_fallible(GCancellable* cancellable) {
+bool GjsContextPrivate::run_jobs_fallible() {
     bool retval = true;
 
     if (m_draining_job_queue || m_should_exit)
@@ -1064,13 +1111,24 @@ bool GjsContextPrivate::run_jobs_fallible(GCancellable* cancellable) {
     JS::HandleValueArray args(JS::HandleValueArray::empty());
     JS::RootedValue rval(m_cx);
 
+    if (m_job_queue.length() == 0) {
+        // Check FinalizationRegistry cleanup tasks at least once if there are
+        // no microtasks queued. This may enqueue more microtasks, which will be
+        // appended to m_job_queue.
+        if (!run_finalization_registry_cleanup())
+            retval = false;
+    }
+
     /* Execute jobs in a loop until we've reached the end of the queue.
      * Since executing a job can trigger enqueueing of additional jobs,
      * it's crucial to recheck the queue length during each iteration. */
     for (size_t ix = 0; ix < m_job_queue.length(); ix++) {
         /* A previous job might have set this flag. e.g., System.exit(). */
-        if (m_should_exit || g_cancellable_is_cancelled(cancellable))
+        if (m_should_exit || !m_dispatcher.is_running()) {
+            gjs_debug(GJS_DEBUG_MAINLOOP, "Stopping jobs because of %s",
+                      m_should_exit ? "exit" : "main loop cancel");
             break;
+        }
 
         job = m_job_queue[ix];
 
@@ -1084,7 +1142,7 @@ bool GjsContextPrivate::run_jobs_fallible(GCancellable* cancellable) {
         m_job_queue[ix] = nullptr;
         {
             JSAutoRealm ar(m_cx, job);
-            gjs_debug(GJS_DEBUG_CONTEXT, "handling job %s",
+            gjs_debug(GJS_DEBUG_MAINLOOP, "handling job %zu, %s", ix,
                       gjs_debug_object(job).c_str());
             if (!JS::Call(m_cx, JS::UndefinedHandleValue, job, args, &rval)) {
                 /* Uncatchable exception - return false so that
@@ -1103,12 +1161,56 @@ bool GjsContextPrivate::run_jobs_fallible(GCancellable* cancellable) {
                 gjs_log_exception_uncaught(m_cx);
             }
         }
+        gjs_debug(GJS_DEBUG_MAINLOOP, "Completed job %zu", ix);
+
+        // Run FinalizationRegistry cleanup tasks after each job. Cleanup tasks
+        // may enqueue more microtasks, which will be appended to m_job_queue.
+        if (!run_finalization_registry_cleanup())
+            retval = false;
     }
 
     m_draining_job_queue = false;
     m_job_queue.clear();
     warn_about_unhandled_promise_rejections();
     JS::JobQueueIsEmpty(m_cx);
+    return retval;
+}
+
+bool GjsContextPrivate::run_finalization_registry_cleanup() {
+    bool retval = true;
+
+    JS::Rooted<FunctionVector> tasks{m_cx};
+    std::swap(tasks.get(), m_cleanup_tasks);
+    g_assert(m_cleanup_tasks.empty());
+
+    JS::RootedFunction task{m_cx};
+    JS::RootedValue unused_rval{m_cx};
+    for (JSFunction* func : tasks) {
+        gjs_debug(GJS_DEBUG_MAINLOOP,
+                  "Running FinalizationRegistry cleanup callback");
+
+        task.set(func);
+        JS::ExposeObjectToActiveJS(JS_GetFunctionObject(func));
+
+        JSAutoRealm ar{m_cx, JS_GetFunctionObject(func)};
+        if (!JS_CallFunction(m_cx, nullptr, task, JS::HandleValueArray::empty(),
+                             &unused_rval)) {
+            // Same logic as above
+            if (!JS_IsExceptionPending(m_cx)) {
+                if (!should_exit(nullptr))
+                    g_critical(
+                        "FinalizationRegistry callback terminated with "
+                        "uncatchable exception");
+                retval = false;
+                continue;
+            }
+            gjs_log_exception_uncaught(m_cx);
+        }
+
+        gjs_debug(GJS_DEBUG_MAINLOOP,
+                  "Completed FinalizationRegistry cleanup callback");
+    }
+
     return retval;
 }
 
@@ -1151,7 +1253,7 @@ js::UniquePtr<JS::JobQueue::SavedJobQueue> GjsContextPrivate::saveJobQueue(
 }
 
 void GjsContextPrivate::register_unhandled_promise_rejection(
-    uint64_t id, GjsAutoChar&& stack) {
+    uint64_t id, JS::UniqueChars&& stack) {
     m_unhandled_rejection_stacks[id] = std::move(stack);
 }
 
@@ -1164,6 +1266,11 @@ void GjsContextPrivate::unregister_unhandled_promise_rejection(uint64_t id) {
                    "as unhandled",
                    id);
     }
+}
+
+bool GjsContextPrivate::queue_finalization_registry_cleanup(
+    JSFunction* cleanup_task) {
+    return m_cleanup_tasks.append(cleanup_task);
 }
 
 void GjsContextPrivate::async_closure_enqueue_for_gc(Gjs::Closure* trampoline) {
@@ -1295,7 +1402,7 @@ bool GjsContextPrivate::auto_profile_enter() {
         (_gjs_profiler_is_running(m_profiler) || m_should_listen_sigusr2))
         auto_profile = false;
 
-    JSAutoRealm ar(m_cx, m_global);
+    Gjs::AutoMainRealm ar{this};
 
     if (auto_profile)
         gjs_profiler_start(m_profiler);
@@ -1361,6 +1468,30 @@ bool GjsContextPrivate::handle_exit_code(bool no_sync_error_pending,
     return false;
 }
 
+bool GjsContextPrivate::set_main_loop_hook(JSObject* callable) {
+    g_assert(JS::IsCallable(callable) && "main loop hook must be a callable object");
+
+    if (!callable) {
+        m_main_loop_hook = nullptr;
+        return true;
+    }
+
+    if (m_main_loop_hook)
+        return false;
+
+    m_main_loop_hook = callable;
+    return true;
+}
+
+bool GjsContextPrivate::run_main_loop_hook() {
+    JS::RootedObject hook(m_cx, m_main_loop_hook.get());
+    m_main_loop_hook = nullptr;
+    gjs_debug(GJS_DEBUG_MAINLOOP, "Running and clearing main loop hook");
+    JS::RootedValue ignored_rval(m_cx);
+    return JS::Call(m_cx, JS::NullHandleValue, hook,
+                    JS::HandleValueArray::empty(), &ignored_rval);
+}
+
 bool GjsContextPrivate::eval(const char* script, size_t script_len,
                              const char* filename, int* exit_status_p,
                              GError** error) {
@@ -1368,20 +1499,43 @@ bool GjsContextPrivate::eval(const char* script, size_t script_len,
 
     bool auto_profile = auto_profile_enter();
 
-    JSAutoRealm ar(m_cx, m_global);
+    Gjs::AutoMainRealm ar{this};
 
     JS::RootedValue retval(m_cx);
     bool ok = eval_with_scope(nullptr, script, script_len, filename, &retval);
 
-    /* The promise job queue should be drained even on error, to finish
-     * outstanding async tasks before the context is torn down. Drain after
-     * uncaught exceptions have been reported since draining runs callbacks.
-     *
-     * If the main loop returns false we cannot guarantee the state
-     * of our promise queue (a module promise could be pending) so
-     * instead of draining the queue we instead just exit.
-     */
-    if (!ok || m_main_loop.spin(this)) {
+    // If there are no errors and the mainloop hook is set, call it.
+    if (ok && m_main_loop_hook)
+        ok = run_main_loop_hook();
+
+    bool exiting = false;
+
+    // Spin the internal loop until the main loop hook is set or no holds
+    // remain.
+    // If the main loop returns false we cannot guarantee the state of our
+    // promise queue (a module promise could be pending) so instead of draining
+    // draining the queue we instead just exit.
+    if (ok && !m_main_loop.spin(this)) {
+        exiting = true;
+    }
+
+    // If the hook has been set again, enter a loop until an error is
+    // encountered or the main loop is quit.
+    while (ok && !exiting && m_main_loop_hook) {
+        ok = run_main_loop_hook();
+
+        // Additional jobs could have been enqueued from the
+        // main loop hook
+        if (ok && !m_main_loop.spin(this)) {
+            exiting = true;
+        }
+    }
+
+    // The promise job queue should be drained even on error, to finish
+    // outstanding async tasks before the context is torn down. Drain after
+    // uncaught exceptions have been reported since draining runs callbacks.
+    // We do not drain if we are exiting.
+    if (!ok && !exiting) {
         JS::AutoSaveExceptionState saved_exc(m_cx);
         ok = run_jobs_fallible() && ok;
     }
@@ -1411,7 +1565,7 @@ bool GjsContextPrivate::eval_module(const char* identifier,
 
     bool auto_profile = auto_profile_enter();
 
-    JSAutoRealm ac(m_cx, m_global);
+    Gjs::AutoMainRealm ar{this};
 
     JS::RootedObject registry(m_cx, gjs_get_module_registry(m_global));
     JS::RootedId key(m_cx, gjs_intern_string_to_id(m_cx, identifier));
@@ -1425,7 +1579,7 @@ bool GjsContextPrivate::eval_module(const char* identifier,
         return false;
     }
 
-    if (!JS::ModuleInstantiate(m_cx, obj)) {
+    if (!JS::ModuleLink(m_cx, obj)) {
         gjs_log_exception(m_cx);
         g_set_error(error, GJS_ERROR, GJS_ERROR_FAILED,
                     "Failed to resolve imports for module: '%s'", identifier);
@@ -1443,18 +1597,35 @@ bool GjsContextPrivate::eval_module(const char* identifier,
 
         ok = add_promise_reactions(
             m_cx, evaluation_promise, on_context_module_resolved,
-            on_context_module_rejected_log_exception, "context");
+            on_context_module_rejected_log_exception, identifier);
     }
 
-    /* The promise job queue should be drained even on error, to finish
-     * outstanding async tasks before the context is torn down. Drain after
-     * uncaught exceptions have been reported since draining runs callbacks.
-     *
-     * If the main loop returns false we cannot guarantee the state
-     * of our promise queue (a module promise could be pending) so
-     * instead of draining the queue we instead just exit.
-     */
-    if (!ok || m_main_loop.spin(this)) {
+    bool exiting = false;
+
+    do {
+        // If there are no errors and the mainloop hook is set, call it.
+        if (ok && m_main_loop_hook)
+            ok = run_main_loop_hook();
+
+        // Spin the internal loop until the main loop hook is set or no holds
+        // remain.
+        //
+        // If the main loop returns false we cannot guarantee the state of our
+        // promise queue (a module promise could be pending) so instead of
+        // draining the queue we instead just exit.
+        //
+        // Additional jobs could have been enqueued from the
+        // main loop hook
+        if (ok && !m_main_loop.spin(this)) {
+            exiting = true;
+        }
+    } while (ok && !exiting && m_main_loop_hook);
+
+    // The promise job queue should be drained even on error, to finish
+    // outstanding async tasks before the context is torn down. Drain after
+    // uncaught exceptions have been reported since draining runs callbacks.
+    // We do not drain if we are exiting.
+    if (!ok && !exiting) {
         JS::AutoSaveExceptionState saved_exc(m_cx);
         ok = run_jobs_fallible() && ok;
     }
@@ -1471,7 +1642,7 @@ bool GjsContextPrivate::eval_module(const char* identifier,
 
 bool GjsContextPrivate::register_module(const char* identifier, const char* uri,
                                         GError** error) {
-    JSAutoRealm ar(m_cx, m_global);
+    Gjs::AutoMainRealm ar{this};
 
     if (gjs_module_load(m_cx, identifier, uri))
         return true;
@@ -1624,7 +1795,7 @@ gjs_context_define_string_array(GjsContext  *js_context,
     g_return_val_if_fail(GJS_IS_CONTEXT(js_context), false);
     GjsContextPrivate* gjs = GjsContextPrivate::from_object(js_context);
 
-    JSAutoRealm ar(gjs->context(), gjs->global());
+    Gjs::AutoMainRealm ar{gjs};
 
     std::vector<std::string> strings;
     if (array_values) {
@@ -1678,6 +1849,44 @@ gjs_context_make_current (GjsContext *context)
     current_context = context;
 }
 
+namespace Gjs {
+/*
+ * Gjs::AutoMainRealm:
+ * @gjs: a #GjsContextPrivate
+ *
+ * Enters the realm of the "main global" for the context, and leaves when the
+ * object is destructed at the end of the scope. The main global is the global
+ * object under which all user JS code is executed. It is used as the root
+ * object for the scope of modules loaded by GJS in this context.
+ *
+ * Only code in a different realm, such as the debugger code or the module
+ * loader code, uses a different global object.
+ */
+AutoMainRealm::AutoMainRealm(GjsContextPrivate* gjs)
+    : JSAutoRealm(gjs->context(), gjs->global()) {}
+
+AutoMainRealm::AutoMainRealm(JSContext* cx)
+    : AutoMainRealm(static_cast<GjsContextPrivate*>(JS_GetContextPrivate(cx))) {
+}
+
+/*
+ * Gjs::AutoInternalRealm:
+ * @gjs: a #GjsContextPrivate
+ *
+ * Enters the realm of the "internal global" for the context, and leaves when
+ * the object is destructed at the end of the scope. The internal global is only
+ * used for executing the module loader code, to keep it separate from user
+ * code.
+ */
+AutoInternalRealm::AutoInternalRealm(GjsContextPrivate* gjs)
+    : JSAutoRealm(gjs->context(), gjs->internal_global()) {}
+
+AutoInternalRealm::AutoInternalRealm(JSContext* cx)
+    : AutoInternalRealm(
+          static_cast<GjsContextPrivate*>(JS_GetContextPrivate(cx))) {}
+
+}  // namespace Gjs
+
 /**
  * gjs_context_get_profiler:
  * @self: the #GjsContext
@@ -1704,4 +1913,26 @@ const char *
 gjs_get_js_version(void)
 {
     return JS_GetImplementationVersion();
+}
+
+/**
+ * gjs_context_run_in_realm:
+ * @self: the #GjsContext
+ * @func: (scope call): function to run
+ * @user_data: (closure func): pointer to pass to @func
+ *
+ * Runs @func immediately, not asynchronously, after entering the JS context's
+ * main realm. After @func completes, leaves the realm again.
+ *
+ * You only need this if you are using JSAPI calls from the SpiderMonkey API
+ * directly.
+ */
+void gjs_context_run_in_realm(GjsContext* self, GjsContextInRealmFunc func,
+                              void* user_data) {
+    g_return_if_fail(GJS_IS_CONTEXT(self));
+    g_return_if_fail(func);
+
+    GjsContextPrivate* gjs = GjsContextPrivate::from_object(self);
+    Gjs::AutoMainRealm ar{gjs};
+    func(self, user_data);
 }

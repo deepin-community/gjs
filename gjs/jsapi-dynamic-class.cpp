@@ -13,16 +13,15 @@
 #include <js/CallArgs.h>  // for JSNative
 #include <js/Class.h>
 #include <js/ComparisonOperators.h>
+#include <js/ErrorReport.h>         // for JSEXN_TYPEERR
 #include <js/Object.h>              // for GetClass
 #include <js/PropertyAndElement.h>  // for JS_DefineFunctions, JS_DefinePro...
 #include <js/Realm.h>  // for GetRealmObjectPrototype
 #include <js/RootingAPI.h>
 #include <js/TypeDecls.h>
 #include <js/Value.h>
-#include <js/ValueArray.h>
 #include <jsapi.h>        // for JS_GetFunctionObject, JS_GetPrototype
 #include <jsfriendapi.h>  // for GetFunctionNativeReserved, NewFun...
-#include <jspubtd.h>      // for JSProto_TypeError
 
 #include "gjs/atoms.h"
 #include "gjs/context-private.h"
@@ -31,6 +30,9 @@
 
 struct JSFunctionSpec;
 struct JSPropertySpec;
+namespace JS {
+class HandleValueArray;
+}
 
 /* Reserved slots of JSNative accessor wrappers */
 enum {
@@ -119,7 +121,7 @@ gjs_typecheck_instance(JSContext       *context,
         if (throw_error) {
             const JSClass* obj_class = JS::GetClass(obj);
 
-            gjs_throw_custom(context, JSProto_TypeError, nullptr,
+            gjs_throw_custom(context, JSEXN_TYPEERR, nullptr,
                              "Object %p is not a subclass of %s, it's a %s",
                              obj.get(), static_clasp->name,
                              format_dynamic_class_name(obj_class->name));
@@ -192,31 +194,32 @@ define_native_accessor_wrapper(JSContext      *cx,
  *
  * Returns: %true on success, %false if an exception is pending on @cx.
  */
-bool
-gjs_define_property_dynamic(JSContext       *cx,
-                            JS::HandleObject proto,
-                            const char      *prop_name,
-                            const char      *func_namespace,
-                            JSNative         getter,
-                            JSNative         setter,
-                            JS::HandleValue  private_slot,
-                            unsigned         flags)
-{
+bool gjs_define_property_dynamic(JSContext* cx, JS::HandleObject proto,
+                                 const char* prop_name, JS::HandleId id,
+                                 const char* func_namespace, JSNative getter,
+                                 JS::HandleValue getter_slot, JSNative setter,
+                                 JS::HandleValue setter_slot, unsigned flags) {
     GjsAutoChar getter_name = g_strconcat(func_namespace, "_get::", prop_name, nullptr);
     GjsAutoChar setter_name = g_strconcat(func_namespace, "_set::", prop_name, nullptr);
 
-    JS::RootedObject getter_obj(cx,
-        define_native_accessor_wrapper(cx, getter, 0, getter_name, private_slot));
+    JS::RootedObject getter_obj(
+        cx, define_native_accessor_wrapper(cx, getter, 0, getter_name,
+                                           getter_slot));
     if (!getter_obj)
         return false;
 
-    JS::RootedObject setter_obj(cx,
-        define_native_accessor_wrapper(cx, setter, 1, setter_name, private_slot));
+    JS::RootedObject setter_obj(
+        cx, define_native_accessor_wrapper(cx, setter, 1, setter_name,
+                                           setter_slot));
     if (!setter_obj)
         return false;
 
-    return JS_DefineProperty(cx, proto, prop_name, getter_obj, setter_obj,
-                             flags);
+    if (id.isVoid()) {
+        return JS_DefineProperty(cx, proto, prop_name, getter_obj, setter_obj,
+                                 flags);
+    }
+
+    return JS_DefinePropertyById(cx, proto, id, getter_obj, setter_obj, flags);
 }
 
 /**

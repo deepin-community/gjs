@@ -141,6 +141,8 @@ class ObjectBase
     GJS_JSAPI_RETURN_CONVENTION
     static bool connect_after(JSContext* cx, unsigned argc, JS::Value* vp);
     GJS_JSAPI_RETURN_CONVENTION
+    static bool connect_object(JSContext* cx, unsigned argc, JS::Value* vp);
+    GJS_JSAPI_RETURN_CONVENTION
     static bool emit(JSContext* cx, unsigned argc, JS::Value* vp);
     GJS_JSAPI_RETURN_CONVENTION
     static bool signal_find(JSContext* cx, unsigned argc, JS::Value* vp);
@@ -157,6 +159,10 @@ class ObjectBase
 
     /* Quarks */
 
+ protected:
+    [[nodiscard]] static GQuark instance_strings_quark();
+
+ public:
     [[nodiscard]] static GQuark custom_type_quark();
     [[nodiscard]] static GQuark custom_property_quark();
     [[nodiscard]] static GQuark disposed_quark();
@@ -181,16 +187,12 @@ class ObjectPrototype
                                     ObjectInstance>;
     friend class GIWrapperBase<ObjectBase, ObjectPrototype, ObjectInstance>;
 
-    using PropertyCache =
-        JS::GCHashMap<JS::Heap<JSString*>, GjsAutoParam,
-                      js::DefaultHasher<JSString*>, js::SystemAllocPolicy>;
     using FieldCache =
-        JS::GCHashMap<JS::Heap<JSString*>, GjsAutoInfo<GI_INFO_TYPE_FIELD>,
+        JS::GCHashMap<JS::Heap<JSString*>, GjsAutoFieldInfo,
                       js::DefaultHasher<JSString*>, js::SystemAllocPolicy>;
     using NegativeLookupCache =
         JS::GCHashSet<JS::Heap<jsid>, IdHasher, js::SystemAllocPolicy>;
 
-    PropertyCache m_property_cache;
     FieldCache m_field_cache;
     NegativeLookupCache m_unresolvable_cache;
     // a list of vfunc GClosures installed on this prototype, used when tracing
@@ -220,8 +222,8 @@ class ObjectPrototype
 
     GJS_JSAPI_RETURN_CONVENTION
     bool lazy_define_gobject_property(JSContext* cx, JS::HandleObject obj,
-                                      JS::HandleId id, bool* resolved,
-                                      const char* name);
+                                      JS::HandleId id, GParamSpec*,
+                                      bool* resolved, const char* name);
 
     enum ResolveWhat { ConsiderOnlyMethods, ConsiderMethodsAndProperties };
     GJS_JSAPI_RETURN_CONVENTION
@@ -236,11 +238,15 @@ class ObjectPrototype
     void set_interfaces(GType* interface_gtypes, uint32_t n_interface_gtypes);
     void set_type_qdata(void);
     GJS_JSAPI_RETURN_CONVENTION
-    GParamSpec* find_param_spec_from_id(JSContext* cx, JS::HandleString key);
+    GParamSpec* find_param_spec_from_id(JSContext*,
+                                        GjsAutoTypeClass<GObjectClass> const&,
+                                        JS::HandleString key);
     GJS_JSAPI_RETURN_CONVENTION
     GIFieldInfo* lookup_cached_field_info(JSContext* cx, JS::HandleString key);
     GJS_JSAPI_RETURN_CONVENTION
-    bool props_to_g_parameters(JSContext* cx, JS::HandleObject props,
+    bool props_to_g_parameters(JSContext*,
+                               GjsAutoTypeClass<GObjectClass> const&,
+                               JS::HandleObject props,
                                std::vector<const char*>* names,
                                AutoGValueVector* values);
 
@@ -375,17 +381,15 @@ class ObjectInstance : public GIWrapperInstance<ObjectBase, ObjectPrototype,
     void track_gobject_finalization();
     void ignore_gobject_finalization();
     void check_js_object_finalized(void);
-    GJS_JSAPI_RETURN_CONVENTION bool ensure_uses_toggle_ref(JSContext* cx);
+    void ensure_uses_toggle_ref(JSContext*);
     [[nodiscard]] bool check_gobject_disposed_or_finalized(
         const char* for_what) const;
     [[nodiscard]] bool check_gobject_finalized(const char* for_what) const;
     GJS_JSAPI_RETURN_CONVENTION
-    bool signal_match_arguments_from_object(JSContext* cx,
-                                            JS::HandleObject props_obj,
-                                            GSignalMatchType* mask_out,
-                                            unsigned* signal_id_out,
-                                            GQuark* detail_out,
-                                            JS::MutableHandleFunction func_out);
+    bool signal_match_arguments_from_object(
+        JSContext* cx, JS::HandleObject props_obj, GSignalMatchType* mask_out,
+        unsigned* signal_id_out, GQuark* detail_out,
+        JS::MutableHandleObject callable_out);
 
  public:
     static GObject* copy_ptr(JSContext*, GType, void* ptr) {
@@ -395,6 +399,8 @@ class ObjectInstance : public GIWrapperInstance<ObjectBase, ObjectPrototype,
     GJS_JSAPI_RETURN_CONVENTION
     bool init_custom_class_from_gobject(JSContext* cx, JS::HandleObject wrapper,
                                         GObject* gobj);
+
+    static void associate_string(GObject* obj, char* str);
 
     /* Methods to manipulate the linked list of instances */
 
@@ -426,14 +432,13 @@ class ObjectInstance : public GIWrapperInstance<ObjectBase, ObjectPrototype,
 
  private:
     GJS_JSAPI_RETURN_CONVENTION
-    bool prop_getter_impl(JSContext* cx, JS::HandleString name,
+    bool prop_getter_impl(JSContext* cx, GParamSpec*,
                           JS::MutableHandleValue rval);
     GJS_JSAPI_RETURN_CONVENTION
     bool field_getter_impl(JSContext* cx, JS::HandleString name,
                            JS::MutableHandleValue rval);
     GJS_JSAPI_RETURN_CONVENTION
-    bool prop_setter_impl(JSContext* cx, JS::HandleString name,
-                          JS::HandleValue value);
+    bool prop_setter_impl(JSContext* cx, GParamSpec*, JS::HandleValue value);
     GJS_JSAPI_RETURN_CONVENTION
     bool field_setter_not_impl(JSContext* cx, JS::HandleString name);
 
@@ -447,7 +452,8 @@ class ObjectInstance : public GIWrapperInstance<ObjectBase, ObjectPrototype,
 
  private:
     GJS_JSAPI_RETURN_CONVENTION
-    bool connect_impl(JSContext* cx, const JS::CallArgs& args, bool after);
+    bool connect_impl(JSContext* cx, const JS::CallArgs& args, bool after,
+                      bool object = false);
     GJS_JSAPI_RETURN_CONVENTION
     bool emit_impl(JSContext* cx, const JS::CallArgs& args);
     GJS_JSAPI_RETURN_CONVENTION
@@ -479,10 +485,6 @@ GJS_JSAPI_RETURN_CONVENTION
 bool gjs_lookup_object_constructor(JSContext             *context,
                                    GType                  gtype,
                                    JS::MutableHandleValue value_p);
-GJS_JSAPI_RETURN_CONVENTION
-JSObject* gjs_lookup_object_constructor_from_info(JSContext* cx,
-                                                  GIObjectInfo* info,
-                                                  GType gtype);
 
 void gjs_object_clear_toggles(void);
 void gjs_object_shutdown_toggle_queue(void);

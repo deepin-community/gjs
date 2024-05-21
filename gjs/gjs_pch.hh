@@ -6,6 +6,7 @@
 #include "config.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
@@ -79,6 +80,8 @@
 #include <js/MemoryFunctions.h>
 #include <js/Modules.h>
 #include <js/Object.h>
+#include <js/Principals.h>
+#include <js/Printer.h>
 #include <js/ProfilingCategory.h>
 #include <js/ProfilingStack.h>
 #include <js/Promise.h>
@@ -87,12 +90,14 @@
 #include <js/PropertySpec.h>
 #include <js/Realm.h>
 #include <js/RealmOptions.h>
+#include <js/Result.h>
 #include <js/RootingAPI.h>
 #include <js/SavedFrameAPI.h>
 #include <js/ScriptPrivate.h>
 #include <js/SourceText.h>
 #include <js/Stack.h>
 #include <js/String.h>
+#include <js/StructuredClone.h>
 #include <js/Symbol.h>
 #include <js/TracingAPI.h>
 #include <js/TypeDecls.h>
@@ -116,11 +121,12 @@
 #include <mozilla/HashTable.h>
 #include <mozilla/Likely.h>
 #include <mozilla/Maybe.h>
+#include <mozilla/Result.h>
+#include <mozilla/ResultVariant.h>
+#include <mozilla/ScopeExit.h>
 #include <mozilla/Span.h>
-#include <mozilla/Tuple.h>
 #include <mozilla/UniquePtr.h>
 #include <mozilla/Unused.h>
-#include <mozilla/Vector.h>
 #ifdef HAVE_READLINE_READLINE_H
 #include <readline/history.h>
 #include <readline/readline.h>
@@ -138,7 +144,7 @@
 #include <sys/types.h>
 #ifdef ENABLE_PROFILER
 #include <alloca.h>
-#include <syscall.h>
+#include <sys/syscall.h>
 #include <sysprof-capture.h>
 #endif
 #ifdef HAVE_UNISTD_H

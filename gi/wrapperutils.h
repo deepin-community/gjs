@@ -19,20 +19,21 @@
 
 #include <js/CallArgs.h>
 #include <js/ComparisonOperators.h>
+#include <js/ErrorReport.h>  // for JSEXN_TYPEERR
 #include <js/Id.h>
 #include <js/MemoryFunctions.h>
 #include <js/Object.h>
 #include <js/PropertyAndElement.h>  // for JS_DefineFunctionById
 #include <js/RootingAPI.h>
 #include <js/TypeDecls.h>
-#include <jsapi.h>       // for JS_GetPrototype
-#include <jspubtd.h>     // for JSProto_TypeError
+#include <js/Value.h>
+#include <jsapi.h>  // for JS_GetPrototype
 
 #include "gi/arg-inl.h"
 #include "gi/cwrapper.h"
 #include "gjs/atoms.h"
 #include "gjs/context-private.h"
-#include "gjs/jsapi-class.h"  // IWYU pragma: keep
+#include "gjs/jsapi-class.h"
 #include "gjs/jsapi-util.h"
 #include "gjs/macros.h"
 #include "gjs/profiler-private.h"
@@ -634,12 +635,12 @@ class GIWrapperBase : public CWrapperPointerOps<Base> {
 
         if (expected_info) {
             gjs_throw_custom(
-                cx, JSProto_TypeError, nullptr,
+                cx, JSEXN_TYPEERR, nullptr,
                 "Object is of type %s.%s - cannot convert to %s.%s", priv->ns(),
                 priv->name(), g_base_info_get_namespace(expected_info),
                 g_base_info_get_name(expected_info));
         } else {
-            gjs_throw_custom(cx, JSProto_TypeError, nullptr,
+            gjs_throw_custom(cx, JSEXN_TYPEERR, nullptr,
                              "Object is of type %s.%s - cannot convert to %s",
                              priv->ns(), priv->name(),
                              g_type_name(expected_gtype));

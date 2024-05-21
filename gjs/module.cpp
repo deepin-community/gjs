@@ -7,9 +7,8 @@
 #include <stddef.h>     // for size_t
 #include <string.h>
 
-#include <string>  // for u16string
-
 #include <gio/gio.h>
+#include <glib-object.h>
 #include <glib.h>
 
 #include <js/CallAndConstruct.h>
@@ -29,7 +28,6 @@
 #include <js/Promise.h>
 #include <js/PropertyAndElement.h>
 #include <js/PropertyDescriptor.h>
-#include <js/Realm.h>
 #include <js/RootingAPI.h>
 #include <js/ScriptPrivate.h>
 #include <js/SourceText.h>
@@ -44,6 +42,7 @@
 
 #include "gjs/atoms.h"
 #include "gjs/context-private.h"
+#include "gjs/deprecation.h"
 #include "gjs/global.h"
 #include "gjs/jsapi-util-args.h"
 #include "gjs/jsapi-util.h"
@@ -59,20 +58,16 @@ union Utf8Unit;
 }
 
 class GjsScriptModule {
-    char *m_name;
+    GjsAutoChar m_name;
 
     // Reserved slots
     static const size_t POINTER = 0;
 
-    GjsScriptModule(const char* name) {
-        m_name = g_strdup(name);
+    GjsScriptModule(const char* name) : m_name(g_strdup(name)) {
         GJS_INC_COUNTER(module);
     }
 
-    ~GjsScriptModule() {
-        g_free(m_name);
-        GJS_DEC_COUNTER(module);
-    }
+    ~GjsScriptModule() { GJS_DEC_COUNTER(module); }
 
     GjsScriptModule(GjsScriptModule&) = delete;
     GjsScriptModule& operator=(GjsScriptModule&) = delete;
@@ -103,7 +98,7 @@ class GjsScriptModule {
         if (!JS_DefinePropertyById(cx, importer, name, module,
                                    GJS_MODULE_PROP_FLAGS & ~JSPROP_PERMANENT)) {
             gjs_debug(GJS_DEBUG_IMPORTER, "Failed to define '%s' in importer",
-                      m_name);
+                      m_name.get());
             return false;
         }
 
@@ -144,7 +139,8 @@ class GjsScriptModule {
         GjsContextPrivate* gjs = GjsContextPrivate::from_cx(cx);
         gjs->schedule_gc_if_needed();
 
-        gjs_debug(GJS_DEBUG_IMPORTER, "Importing module %s succeeded", m_name);
+        gjs_debug(GJS_DEBUG_IMPORTER, "Importing module %s succeeded",
+                  m_name.get());
 
         return true;
     }
@@ -156,7 +152,7 @@ class GjsScriptModule {
                 JS::HandleObject module,
                 GFile           *file)
     {
-        GError *error = nullptr;
+        GjsAutoError error;
         GjsAutoChar script;
         size_t script_len = 0;
 
@@ -197,14 +193,9 @@ class GjsScriptModule {
          * be supported according to ES6. For compatibility with earlier GJS,
          * we treat it as if it were a real property, but warn about it. */
 
-        g_warning("Some code accessed the property '%s' on the module '%s'. "
-                  "That property was defined with 'let' or 'const' inside the "
-                  "module. This was previously supported, but is not correct "
-                  "according to the ES6 standard. Any symbols to be exported "
-                  "from a module must be defined with 'var'. The property "
-                  "access will work as previously for the time being, but "
-                  "please fix your code anyway.",
-                  gjs_debug_id(id).c_str(), m_name);
+        _gjs_warn_deprecated_once_per_callsite(
+            cx, GjsDeprecationMessageId::ModuleExportedLetOrConst,
+            {gjs_debug_id(id).c_str(), m_name});
 
         JS::Rooted<JS::PropertyDescriptor> desc(cx, maybe_desc.value());
         return JS_DefinePropertyById(cx, module, id, desc);
@@ -430,8 +421,8 @@ static bool import_native_module_sync(JSContext* cx, unsigned argc,
     if (!gjs_parse_call_args(cx, "importSync", args, "s", "identifier", &id))
         return false;
 
-    JS::RootedObject global(cx, gjs_get_import_global(cx));
-    JSAutoRealm ar(cx, global);
+    Gjs::AutoMainRealm ar{cx};
+    JS::RootedObject global{cx, JS::CurrentGlobalOrNull(cx)};
 
     JS::AutoSaveExceptionState exc_state(cx);
 
@@ -448,7 +439,8 @@ static bool import_native_module_sync(JSContext* cx, unsigned argc,
     }
 
     JS::RootedObject native_obj(cx);
-    if (!Gjs::NativeModuleRegistry::get().load(cx, id.get(), &native_obj)) {
+    if (!Gjs::NativeModuleDefineFuncs::get().define(cx, id.get(),
+                                                    &native_obj)) {
         gjs_throw(cx, "Failed to load native module: %s", id.get());
         return false;
     }
@@ -502,13 +494,32 @@ bool gjs_populate_module_meta(JSContext* cx, JS::HandleValue private_ref,
     return true;
 }
 
+// Canonicalize specifier so that differently-spelled specifiers referring to
+// the same module don't result in duplicate entries in the registry
+static bool canonicalize_specifier(JSContext* cx,
+                                   JS::MutableHandleString specifier) {
+    JS::UniqueChars specifier_utf8 = JS_EncodeStringToUTF8(cx, specifier);
+    if (!specifier_utf8)
+        return false;
+
+    GjsAutoUnref<GFile> file = g_file_new_for_uri(specifier_utf8.get());
+    GjsAutoChar canonical_specifier = g_file_get_uri(file);
+    JS::ConstUTF8CharsZ chars{canonical_specifier, strlen(canonical_specifier)};
+    JS::RootedString new_specifier{cx, JS_NewStringCopyUTF8Z(cx, chars)};
+    if (!new_specifier)
+        return false;
+
+    specifier.set(new_specifier);
+    return true;
+}
+
 /**
  * gjs_module_resolve:
  *
  * Hook SpiderMonkey calls to resolve import specifiers.
  *
  * @param importingModulePriv the private value of the #Module object initiating
- *   the import.
+ *   the import, or a JS null value
  * @param specifier the import specifier to resolve
  *
  * @returns whether an error occurred while resolving the specifier.
@@ -519,9 +530,6 @@ JSObject* gjs_module_resolve(JSContext* cx, JS::HandleValue importingModulePriv,
               gjs_global_is_type(cx, GjsGlobalType::INTERNAL)) &&
              "gjs_module_resolve can only be called from module-enabled "
              "globals.");
-    g_assert(importingModulePriv.isObject() &&
-             "the importing module can't be null, don't add import to the "
-             "bootstrap script");
     JS::RootedString specifier(
         cx, JS::GetModuleRequestSpecifier(cx, module_request));
 
@@ -531,14 +539,17 @@ JSObject* gjs_module_resolve(JSContext* cx, JS::HandleValue importingModulePriv,
     g_assert(v_loader.isObject());
     JS::RootedObject loader(cx, &v_loader.toObject());
 
+    if (!canonicalize_specifier(cx, &specifier))
+        return nullptr;
+
     JS::RootedValueArray<2> args(cx);
     args[0].set(importingModulePriv);
     args[1].setString(specifier);
 
     gjs_debug(GJS_DEBUG_IMPORTER,
-              "Module resolve hook for module '%s' (relative to %p), global %p",
+              "Module resolve hook for module %s (relative to %s), global %p",
               gjs_debug_string(specifier).c_str(),
-              &importingModulePriv.toObject(), global.get());
+              gjs_debug_value(importingModulePriv).c_str(), global.get());
 
     JS::RootedValue result(cx);
     if (!JS::Call(cx, loader, "moduleResolveHook", args, &result))
@@ -614,14 +625,13 @@ static bool import_resolved(JSContext* cx, unsigned argc, JS::Value* vp) {
 
     gjs_debug(GJS_DEBUG_IMPORTER, "Async import promise resolved");
 
-    JS::RootedObject global(cx, gjs_get_import_global(cx));
-    JSAutoRealm ar(cx, global);
+    Gjs::AutoMainRealm ar{cx};
 
     g_assert(args[0].isObject());
     JS::RootedObject module(cx, &args[0].toObject());
 
     JS::RootedValue evaluation_promise(cx);
-    if (!JS::ModuleInstantiate(cx, module) ||
+    if (!JS::ModuleLink(cx, module) ||
         !JS::ModuleEvaluate(cx, module, &evaluation_promise))
         return fail_import(cx, args);
 
@@ -641,7 +651,7 @@ bool gjs_dynamic_module_resolve(JSContext* cx,
              "global.");
 
     JS::RootedObject global(cx, JS::CurrentGlobalOrNull(cx));
-    JSAutoRealm ar(cx, global);
+    g_assert(global && "gjs_dynamic_module_resolve must be in a realm");
 
     JS::RootedValue v_loader(
         cx, gjs_get_global_slot(global, GjsGlobalSlot::MODULE_LOADER));
@@ -649,6 +659,9 @@ bool gjs_dynamic_module_resolve(JSContext* cx,
     JS::RootedObject loader(cx, &v_loader.toObject());
     JS::RootedString specifier(
         cx, JS::GetModuleRequestSpecifier(cx, module_request));
+
+    if (!canonicalize_specifier(cx, &specifier))
+        return false;
 
     JS::RootedObject callback_data(cx, JS_NewPlainObject(cx));
     if (!callback_data ||
@@ -662,13 +675,13 @@ bool gjs_dynamic_module_resolve(JSContext* cx,
 
     if (importing_module_priv.isObject()) {
         gjs_debug(GJS_DEBUG_IMPORTER,
-                  "Async module resolve hook for module '%s' (relative to %p), "
+                  "Async module resolve hook for module %s (relative to %p), "
                   "global %p",
                   gjs_debug_string(specifier).c_str(),
                   &importing_module_priv.toObject(), global.get());
     } else {
         gjs_debug(GJS_DEBUG_IMPORTER,
-                  "Async module resolve hook for module '%s' (unknown path), "
+                  "Async module resolve hook for module %s (unknown path), "
                   "global %p",
                   gjs_debug_string(specifier).c_str(), global.get());
     }

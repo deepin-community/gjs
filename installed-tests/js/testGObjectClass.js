@@ -352,6 +352,36 @@ describe('GObject class with decorator', function () {
         expect(notifySpy).toHaveBeenCalledTimes(2);
     });
 
+    function asyncIdle() {
+        return new Promise(resolve => {
+            GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                resolve();
+                return GLib.SOURCE_REMOVE;
+            });
+        });
+    }
+
+    it('disconnects connect_object signals on destruction', async function () {
+        let callback = jasmine.createSpy('callback');
+        callback.myInstance = myInstance;
+        const instance2 = new MyObject();
+        instance2.connect_object('empty', callback, myInstance, 0);
+
+        instance2.emitEmpty();
+        instance2.emitEmpty();
+
+        expect(callback).toHaveBeenCalledTimes(2);
+
+        const weakRef = new WeakRef(myInstance);
+        myInstance = null;
+        callback = null;
+
+        await asyncIdle();
+        System.gc();
+
+        expect(weakRef.deref()).toBeUndefined();
+    });
+
     it('can define its own signals', function () {
         let emptySpy = jasmine.createSpy('emptySpy');
         myInstance.connect('empty', emptySpy);
@@ -909,6 +939,16 @@ describe('GObject virtual function', function () {
             vfunc_init_async() {}
         })).toThrow();
     });
+
+    it('are defined also for static virtual functions', function () {
+        const CustomEmptyGIcon = GObject.registerClass({
+            Implements: [Gio.Icon],
+        }, class CustomEmptyGIcon extends GObject.Object {});
+        expect(Gio.Icon.deserialize).toBeInstanceOf(Function);
+        expect(CustomEmptyGIcon.deserialize).toBe(Gio.Icon.deserialize);
+        expect(Gio.Icon.new_for_string).toBeInstanceOf(Function);
+        expect(CustomEmptyGIcon.new_for_string).toBe(Gio.Icon.new_for_string);
+    });
 });
 
 describe('GObject creation using base classes without registered GType', function () {
@@ -1166,6 +1206,8 @@ describe('Property bindings', function () {
     });
 
     it('can be set up as a group', function () {
+        if (GObject.BindingGroup === undefined)
+            pending('GLib version too old');
         const group = new GObject.BindingGroup({source: a});
         group.bind('string', b, 'string', GObject.BindingFlags.NONE);
         a.string = 'foo';
@@ -1174,6 +1216,8 @@ describe('Property bindings', function () {
     });
 
     it('can be set up as a group with custom mappings', function () {
+        if (GObject.BindingGroup === undefined)
+            pending('GLib version too old');
         const group = new GObject.BindingGroup({source: a});
         group.bind_full('bool', b, 'string', GObject.BindingFlags.NONE,
             (bind, source) => [true, `${source}`],

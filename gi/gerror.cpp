@@ -6,8 +6,6 @@
 
 #include <stdint.h>
 
-#include <string>
-
 #include <girepository.h>
 #include <glib-object.h>
 
@@ -265,7 +263,7 @@ bool ErrorPrototype::define_class(JSContext* context,
 
     /* last attempt: load GIRepository (for invoke errors, rarely
        needed) */
-    g_irepository_require(nullptr, "GIRepository", "1.0",
+    g_irepository_require(nullptr, "GIRepository", "2.0",
                           GIRepositoryLoadFlags(0), nullptr);
     info = g_irepository_find_by_error_domain(nullptr, domain);
 
@@ -532,7 +530,7 @@ GError* gjs_gerror_make_from_thrown_value(JSContext* cx) {
  *
  * Returns: false, for convenience in returning from the calling function.
  */
-bool gjs_throw_gerror(JSContext* cx, GError* error) {
+bool gjs_throw_gerror(JSContext* cx, GjsAutoError const& error) {
     // return false even if the GError is null, as presumably something failed
     // in the calling code, and the caller expects to throw.
     g_return_val_if_fail(error, false);
@@ -540,8 +538,6 @@ bool gjs_throw_gerror(JSContext* cx, GError* error) {
     JS::RootedObject err_obj(cx, ErrorInstance::object_for_c_ptr(cx, error));
     if (!err_obj || !gjs_define_error_properties(cx, err_obj))
         return false;
-
-    g_error_free(error);
 
     JS::RootedValue err(cx, JS::ObjectValue(*err_obj));
     JS_SetPendingException(cx, err);

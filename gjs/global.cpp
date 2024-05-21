@@ -47,20 +47,21 @@ union Utf8Unit;
 
 class GjsBaseGlobal {
     static JSObject* base(JSContext* cx, const JSClass* clasp,
-                          JS::RealmCreationOptions options) {
+                          JS::RealmCreationOptions options,
+                          JSPrincipals* principals = nullptr) {
         // Enable WeakRef without the cleanupSome specification
         // Re-evaluate if cleanupSome is standardized
         // See: https://github.com/tc39/proposal-cleanup-some
-        options.setWeakRefsEnabled(
-            JS::WeakRefSpecifier::EnabledWithoutCleanupSome);
+        options
+            .setWeakRefsEnabled(JS::WeakRefSpecifier::EnabledWithoutCleanupSome)
+            .setChangeArrayByCopyEnabled(true);
 
         JS::RealmBehaviors behaviors;
         JS::RealmOptions compartment_options(options, behaviors);
 
-        JS::RootedObject global(
-            cx, JS_NewGlobalObject(cx, clasp, nullptr, JS::FireOnNewGlobalHook,
-                                   compartment_options));
-
+        JS::RootedObject global{cx, JS_NewGlobalObject(cx, clasp, principals,
+                                                       JS::FireOnNewGlobalHook,
+                                                       compartment_options)};
         if (!global)
             return nullptr;
 
@@ -76,16 +77,18 @@ class GjsBaseGlobal {
  protected:
     [[nodiscard]] static JSObject* create(
         JSContext* cx, const JSClass* clasp,
-        JS::RealmCreationOptions options = JS::RealmCreationOptions()) {
+        JS::RealmCreationOptions options = JS::RealmCreationOptions(),
+        JSPrincipals* principals = nullptr) {
         options.setNewCompartmentAndZone();
-        return base(cx, clasp, options);
+        return base(cx, clasp, options, principals);
     }
 
     [[nodiscard]] static JSObject* create_with_compartment(
         JSContext* cx, JS::HandleObject existing, const JSClass* clasp,
-        JS::RealmCreationOptions options = JS::RealmCreationOptions()) {
+        JS::RealmCreationOptions options = JS::RealmCreationOptions(),
+        JSPrincipals* principals = nullptr) {
         options.setExistingCompartment(existing);
-        return base(cx, clasp, options);
+        return base(cx, clasp, options, principals);
     }
 
     GJS_JSAPI_RETURN_CONVENTION
@@ -132,8 +135,8 @@ class GjsBaseGlobal {
 
         JS::RootedObject native_obj(m_cx);
 
-        if (!Gjs::NativeModuleRegistry::get().load(m_cx, id.get(),
-                                                   &native_obj)) {
+        if (!Gjs::NativeModuleDefineFuncs::get().define(m_cx, id.get(),
+                                                        &native_obj)) {
             gjs_throw(m_cx, "Failed to load native module: %s", id.get());
             return false;
         }
@@ -299,12 +302,13 @@ class GjsInternalGlobal : GjsBaseGlobal {
 
  public:
     [[nodiscard]] static JSObject* create(JSContext* cx) {
-        return GjsBaseGlobal::create(cx, &klass);
+        return GjsBaseGlobal::create(cx, &klass, {}, get_internal_principals());
     }
 
     [[nodiscard]] static JSObject* create_with_compartment(
         JSContext* cx, JS::HandleObject cmp_global) {
-        return GjsBaseGlobal::create_with_compartment(cx, cmp_global, &klass);
+        return GjsBaseGlobal::create_with_compartment(
+            cx, cmp_global, &klass, {}, get_internal_principals());
     }
 
     static bool define_properties(JSContext* cx, JS::HandleObject global,
@@ -450,10 +454,10 @@ bool gjs_global_registry_set(JSContext* cx, JS::HandleObject registry,
 /**
  * gjs_global_registry_get:
  *
- * @brief This function inserts a module object into a global registry.
+ * @brief This function retrieves a module record from the global registry,
+ * or %NULL if the module record is not present.
  * Global registries are JS Map objects for easy reuse and access
- * within internal JS. This function will assert if a module has
- * already been inserted at the given key.
+ * within internal JS.
 
  * @param cx the current #JSContext
  * @param registry a JS Map object

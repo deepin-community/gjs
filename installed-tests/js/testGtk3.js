@@ -177,9 +177,7 @@ describe('Gtk overrides', function () {
 
     it('avoid crashing when GTK vfuncs are called in garbage collection', function () {
         GLib.test_expect_message('Gjs', GLib.LogLevelFlags.LEVEL_CRITICAL,
-            '*during garbage collection*');
-        GLib.test_expect_message('Gjs', GLib.LogLevelFlags.LEVEL_CRITICAL,
-            '*destroy*');
+            '*during garbage collection*offending callback was destroy()*');
 
         const BadLabel = GObject.registerClass(class BadLabel extends Gtk.Label {
             vfunc_destroy() {}
@@ -206,9 +204,7 @@ describe('Gtk overrides', function () {
         expect(spy).toHaveBeenCalledTimes(1);
 
         GLib.test_expect_message('Gjs', GLib.LogLevelFlags.LEVEL_CRITICAL,
-            '*during garbage collection*');
-        GLib.test_expect_message('Gjs', GLib.LogLevelFlags.LEVEL_CRITICAL,
-            '*destroy*');
+            '*during garbage collection*offending callback was destroy()*');
         label = null;
         System.gc();
         GLib.test_assert_expected_messages_internal('Gjs', 'testGtk3.js', 0,
@@ -307,5 +303,37 @@ describe('Gtk overrides', function () {
         expect(frameChild.visible).toBe(false);
         expect(() => widget.show()).not.toThrow();
         expect(frameChild.visible).toBe(true);
+    });
+
+    function asyncIdle() {
+        return new Promise(resolve => {
+            GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                resolve();
+                return GLib.SOURCE_REMOVE;
+            });
+        });
+    }
+
+    it('does not leak instance when connecting template signal', async function () {
+        const LeakTestWidget = GObject.registerClass({
+            Template: ByteArray.fromString(`
+                <interface>
+                    <template class="Gjs_LeakTestWidget" parent="GtkButton">
+                        <signal name="clicked" handler="buttonClicked"/>
+                    </template>
+                </interface>`),
+        }, class LeakTestWidget extends Gtk.Button {
+            buttonClicked() {}
+        });
+
+        const weakRef = new WeakRef(new LeakTestWidget());
+
+        await asyncIdle();
+        // It takes two GC cycles to free the widget, because of the tardy sweep
+        // problem (https://gitlab.gnome.org/GNOME/gjs/-/issues/217)
+        System.gc();
+        System.gc();
+
+        expect(weakRef.deref()).toBeUndefined();
     });
 });

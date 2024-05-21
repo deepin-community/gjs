@@ -69,9 +69,7 @@ function debuggeeValueToString(dv, style = {pretty: options.pretty}) {
         if (style.noerror)
             return [dvrepr, undefined];
 
-        const substyle = {};
-        Object.assign(substyle, style);
-        substyle.noerror = true;
+        const substyle = {...style, noerror: true};
         return [dvrepr, debuggeeValueToString(str.throw, substyle)];
     }
 
@@ -348,7 +346,11 @@ expr may also reference the variables $1, $2, ... for already printed
 expressions, or $$ for the most recently printed expression.`;
 
 function keysCommand(rest) {
-    return doPrint(`Object.keys(${rest})`);
+    return doPrint(`
+        (o => Object.getOwnPropertyNames(o)
+            .concat(Object.getOwnPropertySymbols(o)))
+            (${rest})
+    `);
 }
 keysCommand.summary = 'Prints keys of the given object';
 keysCommand.helpText = `USAGE
@@ -836,7 +838,7 @@ function runcmd(cmd) {
         return undefined;
 
     var first = pieces[0], rest = pieces[1];
-    if (!commands.hasOwnProperty(first)) {
+    if (!Object.hasOwn(commands, first)) {
         print(`unrecognized command '${first}'`);
         return undefined;
     }

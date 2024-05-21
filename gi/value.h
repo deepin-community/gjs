@@ -18,9 +18,8 @@
 
 namespace Gjs {
 struct AutoGValue : GValue {
-    AutoGValue() {
+    AutoGValue() : GValue(G_VALUE_INIT) {
         static_assert(sizeof(AutoGValue) == sizeof(GValue));
-        *static_cast<GValue*>(this) = G_VALUE_INIT;
     }
     explicit AutoGValue(GType gtype) : AutoGValue() {
         g_value_init(this, gtype);
@@ -52,11 +51,12 @@ struct AutoGValue : GValue {
                 break;
             default:
                 // We can't safely move in complex cases, so let's just copy
-                *static_cast<GValue*>(this) = G_VALUE_INIT;
+                this->steal();
                 *this = src;
                 g_value_unset(&src);
         }
     }
+    void steal() { *static_cast<GValue*>(this) = G_VALUE_INIT; }
     ~AutoGValue() { g_value_unset(this); }
 };
 }  // namespace Gjs

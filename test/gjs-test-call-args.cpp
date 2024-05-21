@@ -11,6 +11,7 @@
 #include <js/CallArgs.h>
 #include <js/CompilationAndEvaluation.h>
 #include <js/CompileOptions.h>
+#include <js/GlobalObject.h>  // for CurrentGlobalOrNull
 #include <js/PropertyAndElement.h>
 #include <js/PropertySpec.h>
 #include <js/RootingAPI.h>
@@ -18,6 +19,7 @@
 #include <js/String.h>
 #include <js/TypeDecls.h>
 #include <js/Utility.h>  // for UniqueChars
+#include <js/Value.h>
 
 #include "gjs/jsapi-util-args.h"
 #include "gjs/jsapi-util.h"
@@ -298,7 +300,7 @@ setup(GjsUnitTestFixture *fx,
 {
     gjs_unit_test_fixture_setup(fx, unused);
 
-    JS::RootedObject global(fx->cx, gjs_get_import_global(fx->cx));
+    JS::RootedObject global{fx->cx, JS::CurrentGlobalOrNull(fx->cx)};
     bool success = JS_DefineFunctions(fx->cx, global, native_test_funcs);
     g_assert_true(success);
 }

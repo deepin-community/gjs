@@ -4,6 +4,16 @@
 const ByteArray = imports.byteArray;
 const {Gio, GjsTestTools, GLib} = imports.gi;
 
+// Adapter for compatibility with pre-GLib-2.80
+let GioUnix;
+if (imports.gi.versions.GioUnix === '2.0') {
+    GioUnix = imports.gi.GioUnix;
+} else {
+    GioUnix = {
+        InputStream: Gio.UnixInputStream,
+    };
+}
+
 /* The methods list with their signatures.
  *
  * *** NOTE: If you add stuff here, you need to update the Test class below.
@@ -97,6 +107,7 @@ var TestIface = `<node>
 <property name="PropReadOnly" type="d" access="read" />
 <property name="PropWriteOnly" type="s" access="write" />
 <property name="PropReadWrite" type="v" access="readwrite" />
+<property name="PropPrePacked" type="a{sv}" access="read" />
 </interface>
 </node>`;
 
@@ -222,13 +233,19 @@ class Test {
         this._propReadWrite = value.deepUnpack();
     }
 
+    get PropPrePacked() {
+        return new GLib.Variant('a{sv}', {
+            member: GLib.Variant.new_string('value'),
+        });
+    }
+
     structArray() {
         return [[128, 123456], [42, 654321]];
     }
 
     fdIn(fdIndex, fdList) {
         const fd = fdList.get(fdIndex);
-        const stream = new Gio.UnixInputStream({fd, closeFd: true});
+        const stream = new GioUnix.InputStream({fd, closeFd: true});
         const bytes = stream.read_bytes(4096, null);
         return bytes;
     }
@@ -236,7 +253,7 @@ class Test {
     // Same as fdIn(), but implemented asynchronously
     fdIn2Async([fdIndex], invocation, fdList) {
         const fd = fdList.get(fdIndex);
-        const stream = new Gio.UnixInputStream({fd, closeFd: true});
+        const stream = new GioUnix.InputStream({fd, closeFd: true});
         stream.read_bytes_async(4096, GLib.PRIORITY_DEFAULT, null, (obj, res) => {
             const bytes = obj.read_bytes_finish(res);
             invocation.return_value(new GLib.Variant('(ay)', [bytes]));
@@ -332,6 +349,14 @@ describe('Exported DBus object', function () {
 
     it('can call a method with async/await', async function () {
         const [{hello}] = await proxy.frobateStuffAsync({});
+        expect(hello.deepUnpack()).toEqual('world');
+    });
+
+    it('can initiate a proxy with promise and call a method with async/await', async function () {
+        const asyncProxy = await ProxyClass.newAsync(Gio.DBus.session,
+            'org.gnome.gjs.Test', '/org/gnome/gjs/Test');
+        expect(asyncProxy).toBeInstanceOf(Gio.DBusProxy);
+        const [{hello}] = await asyncProxy.frobateStuffAsync({});
         expect(hello.deepUnpack()).toEqual('world');
     });
 
@@ -712,7 +737,7 @@ describe('Exported DBus object', function () {
     });
 
     function readBytesFromFdSync(fd) {
-        const stream = new Gio.UnixInputStream({fd, closeFd: true});
+        const stream = new GioUnix.InputStream({fd, closeFd: true});
         const bytes = stream.read_bytes(4096, null);
         return ByteArray.fromGBytes(bytes);
     }
@@ -772,9 +797,10 @@ describe('Exported DBus object', function () {
     });
 
     it('Has defined properties', function () {
-        expect(proxy.hasOwnProperty('PropReadWrite')).toBeTruthy();
-        expect(proxy.hasOwnProperty('PropReadOnly')).toBeTruthy();
-        expect(proxy.hasOwnProperty('PropWriteOnly')).toBeTruthy();
+        expect(Object.hasOwn(proxy, 'PropReadWrite')).toBeTruthy();
+        expect(Object.hasOwn(proxy, 'PropReadOnly')).toBeTruthy();
+        expect(Object.hasOwn(proxy, 'PropWriteOnly')).toBeTruthy();
+        expect(Object.hasOwn(proxy, 'PropPrePacked')).toBeTruthy();
     });
 
     it('reading readonly property works', function () {
@@ -818,6 +844,11 @@ describe('Exported DBus object', function () {
         }).toThrowError('Property PropReadOnly is not writable');
 
         expect(proxy.PropReadOnly).toBe(PROP_READ_ONLY_INITIAL_VALUE);
+    });
+
+    it('Reading a property that prepacks the return value works', function () {
+        expect(proxy.PropPrePacked.member).toBeInstanceOf(GLib.Variant);
+        expect(proxy.PropPrePacked.member.get_type_string()).toEqual('s');
     });
 
     it('Marking a property as invalidated works', function () {
@@ -868,6 +899,33 @@ describe('DBus Proxy wrapper', function () {
         writerFunc.calls.reset();
     });
 
+    it('init failures are reported in sync mode', function () {
+        const cancellable = new Gio.Cancellable();
+        cancellable.cancel();
+        expect(() => new ProxyClass(Gio.DBus.session, 'org.gnome.gjs.Test',
+            '/org/gnome/gjs/Test',
+            Gio.DBusProxyFlags.NONE,
+            cancellable)).toThrow();
+    });
+
+    it('init failures are reported in async mode', function () {
+        const cancellable = new Gio.Cancellable();
+        cancellable.cancel();
+        const initDoneSpy = jasmine.createSpy(
+            'init finish func', () => loop.quit());
+        initDoneSpy.and.callThrough();
+        new ProxyClass(Gio.DBus.session, 'org.gnome.gjs.Test',
+            '/org/gnome/gjs/Test',
+            initDoneSpy, cancellable, Gio.DBusProxyFlags.NONE);
+        loop.run();
+
+        expect(initDoneSpy).toHaveBeenCalledTimes(1);
+        const {args: callArgs} = initDoneSpy.calls.mostRecent();
+        expect(callArgs.at(0)).toBeNull();
+        expect(callArgs.at(1).matches(
+            Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED)).toBeTrue();
+    });
+
     it('can init a proxy asynchronously when promisified', function () {
         new ProxyClass(Gio.DBus.session, 'org.gnome.gjs.Test',
             '/org/gnome/gjs/Test',
@@ -876,6 +934,20 @@ describe('DBus Proxy wrapper', function () {
         loop.run();
 
         expect(writerFunc).not.toHaveBeenCalled();
+    });
+
+    it('can create a proxy from a promise', async function () {
+        const proxyPromise = ProxyClass.newAsync(Gio.DBus.session, 'org.gnome.gjs.Test',
+            '/org/gnome/gjs/Test');
+        await expectAsync(proxyPromise).toBeResolved();
+    });
+
+    it('can create fail a proxy from a promise', async function () {
+        const cancellable = new Gio.Cancellable();
+        cancellable.cancel();
+        const proxyPromise = ProxyClass.newAsync(Gio.DBus.session, 'org.gnome.gjs.Test',
+            '/org/gnome/gjs/Test', cancellable);
+        await expectAsync(proxyPromise).toBeRejected();
     });
 
     afterAll(function () {
