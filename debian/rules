@@ -14,6 +14,7 @@ export DH_VERBOSE=1
 
 override_dh_auto_configure:
 	dh_auto_configure -- \
+		--unity=on \
 		-Dauto_features=enabled \
 		-Dprofiler=disabled \
 		$(NULL)

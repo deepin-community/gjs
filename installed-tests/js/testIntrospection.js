@@ -158,7 +158,7 @@ describe('Garbage collection of introspected objects', function () {
         GLib.test_expect_message('Gjs', GLib.LogLevelFlags.LEVEL_WARNING,
             '*property screenfull*');
 
-        const settings = new Gio.Settings({schema: 'org.gnome.GjsTest'});
+        const settings = new Gio.Settings({schemaId: 'org.gnome.GjsTest'});
         let obj = new SomeObject();
         settings.bind('fullscreen', obj, 'screenfull', Gio.SettingsBindFlags.DEFAULT);
         const handler = settings.connect('changed::fullscreen', () => {
@@ -208,5 +208,40 @@ describe('Complete enumeration of GIRepositoryNamespace (new_enumerate)', functi
             // Access each enumerated property to check it can be defined.
             names.forEach(name => Gdk[name]);
         }).not.toThrowError(/API of type .* not implemented, cannot define .*/);
+    });
+});
+
+describe('Backwards compatibility for GLib/Gio platform specific GIRs', function () {
+    // Only test this if GioUnix is available
+    const skip = imports.gi.versions.GioUnix !== '2.0';
+
+    it('GioUnix objects are looked up in GioUnix, not Gio', function () {
+        if (skip) {
+            pending('GioUnix required for this test');
+            return;
+        }
+
+        GLib.test_expect_message('Gjs', GLib.LogLevelFlags.LEVEL_WARNING,
+            '*Gio.UnixMountMonitor*');
+
+        const monitor = Gio.UnixMountMonitor.get();
+        expect(monitor.toString()).toContain('GIName:GioUnix.MountMonitor');
+
+        GLib.test_assert_expected_messages_internal('Gjs',
+            'testIntrospection.js', 0,
+            'Expected deprecation message for Gio.Unix -> GioUnix');
+    });
+
+    it('has some exceptions', function () {
+        expect(Gio.UnixConnection.toString()).toContain('Gio_UnixConnection');
+
+        const credentialsMessage = new Gio.UnixCredentialsMessage();
+        expect(credentialsMessage.toString()).toContain('GIName:Gio.UnixCredentials');
+
+        const fdList = new Gio.UnixFDList();
+        expect(fdList.toString()).toContain('GIName:Gio.UnixFDList');
+
+        const socketAddress = Gio.UnixSocketAddress.new_with_type('', Gio.UnixSocketAddressType.ANONYMOUS);
+        expect(socketAddress.toString()).toContain('GIName:Gio.UnixSocketAddress');
     });
 });

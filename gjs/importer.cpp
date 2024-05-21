@@ -22,7 +22,7 @@
 #include <js/CharacterEncoding.h>
 #include <js/Class.h>
 #include <js/ComparisonOperators.h>
-#include <js/ErrorReport.h>  // for JS_ReportOutOfMemory
+#include <js/ErrorReport.h>  // for JS_ReportOutOfMemory, JSEXN_ERR
 #include <js/Exception.h>
 #include <js/GlobalObject.h>  // for CurrentGlobalOrNull
 #include <js/Id.h>  // for PropertyKey
@@ -36,8 +36,7 @@
 #include <js/TypeDecls.h>
 #include <js/Utility.h>  // for UniqueChars
 #include <js/Value.h>
-#include <jsapi.h>    // for JS_NewPlainObject, IdVector, JS_...
-#include <jspubtd.h>  // for JSProto_Error
+#include <jsapi.h>  // for JS_NewPlainObject, IdVector, JS_...
 #include <mozilla/Maybe.h>
 #include <mozilla/UniquePtr.h>
 
@@ -266,26 +265,21 @@ cancel_import(JSContext       *context,
  * gjs_import_native_module:
  * @cx: the #JSContext
  * @importer: the root importer
- * @parse_name: Name under which the module was registered with
- *  add(), should be in the format as returned by
- *  g_file_get_parse_name()
+ * @id_str: Name under which the module was registered with add()
  *
  * Imports a builtin native-code module so that it is available to JS code as
- * `imports[parse_name]`.
+ * `imports[id_str]`.
  *
  * Returns: true on success, false if an exception was thrown.
  */
-bool
-gjs_import_native_module(JSContext       *cx,
-                         JS::HandleObject importer,
-                         const char      *parse_name)
-{
-    gjs_debug(GJS_DEBUG_IMPORTER, "Importing '%s'", parse_name);
+bool gjs_import_native_module(JSContext* cx, JS::HandleObject importer,
+                              const char* id_str) {
+    gjs_debug(GJS_DEBUG_IMPORTER, "Importing '%s'", id_str);
 
     JS::RootedObject native_registry(
-        cx, gjs_get_native_registry(gjs_get_import_global(cx)));
+        cx, gjs_get_native_registry(JS::CurrentGlobalOrNull(cx)));
 
-    JS::RootedId id(cx, gjs_intern_string_to_id(cx, parse_name));
+    JS::RootedId id(cx, gjs_intern_string_to_id(cx, id_str));
     if (id.isVoid())
         return false;
 
@@ -294,12 +288,12 @@ gjs_import_native_module(JSContext       *cx,
         return false;
 
     if (!module &&
-        (!Gjs::NativeModuleRegistry::get().load(cx, parse_name, &module) ||
+        (!Gjs::NativeModuleDefineFuncs::get().define(cx, id_str, &module) ||
          !gjs_global_registry_set(cx, native_registry, id, module)))
         return false;
 
-    return define_meta_properties(cx, module, nullptr, parse_name, importer) &&
-           JS_DefineProperty(cx, importer, parse_name, module,
+    return define_meta_properties(cx, module, nullptr, id_str, importer) &&
+           JS_DefineProperty(cx, importer, id_str, module,
                              GJS_MODULE_PROP_FLAGS);
 }
 
@@ -310,7 +304,7 @@ import_module_init(JSContext       *context,
                    JS::HandleObject module_obj)
 {
     gsize script_len = 0;
-    GError *error = NULL;
+    GjsAutoError error;
 
     GjsContextPrivate* gjs = GjsContextPrivate::from_cx(context);
     JS::RootedValue ignored(context);
@@ -325,7 +319,6 @@ import_module_init(JSContext       *context,
             return false;
         }
 
-        g_error_free(error);
         return true;
     }
     g_assert(script);
@@ -498,7 +491,7 @@ static bool do_import(JSContext* context, JS::HandleObject obj,
 
     /* First try importing an internal module like gi */
     if (parent.isNull() &&
-        Gjs::NativeModuleRegistry::get().is_registered(name.get())) {
+        Gjs::NativeModuleDefineFuncs::get().is_registered(name.get())) {
         if (!gjs_import_native_module(context, obj, name.get()))
             return false;
 
@@ -607,7 +600,7 @@ static bool do_import(JSContext* context, JS::HandleObject obj,
     /* If no exception occurred, the problem is just that we got to the
      * end of the path. Be sure an exception is set. */
     g_assert(!JS_IsExceptionPending(context));
-    gjs_throw_custom(context, JSProto_Error, "ImportError",
+    gjs_throw_custom(context, JSEXN_ERR, "ImportError",
                      "No JS module '%s' found in search path", name.get());
     return false;
 }
@@ -701,8 +694,7 @@ static bool importer_new_enumerate(JSContext* context, JS::HandleObject object,
                     JS_ReportOutOfMemory(context);
                     return false;
                 }
-            } else if (g_str_has_suffix(filename, "." G_MODULE_SUFFIX) ||
-                       g_str_has_suffix(filename, ".js")) {
+            } else if (g_str_has_suffix(filename, ".js")) {
                 GjsAutoChar filename_noext =
                     g_strndup(filename, strlen(filename) - 3);
                 jsid id = gjs_intern_string_to_id(context, filename_noext);
@@ -899,7 +891,7 @@ static JSObject* gjs_create_importer(
     /* API users can replace this property from JS, is the idea */
     if (!gjs_define_string_array(
             context, importer, "searchPath", search_paths,
-            /* settable (no READONLY) but not deleteable (PERMANENT) */
+            // settable (no READONLY) but not deletable (PERMANENT)
             JSPROP_PERMANENT | JSPROP_RESOLVING))
         return nullptr;
 

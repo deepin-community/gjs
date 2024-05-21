@@ -64,6 +64,54 @@ writeToPNG_func(JSContext *context,
 }
 
 GJS_JSAPI_RETURN_CONVENTION
+bool flush_func(JSContext* cx,
+                unsigned argc,
+                JS::Value* vp) {
+    GJS_GET_THIS(cx, argc, vp, argv, obj);
+
+    if (argc > 1) {
+        gjs_throw(cx, "Surface.flush() takes no arguments");
+        return false;
+    }
+
+    cairo_surface_t* surface = CairoSurface::for_js(cx, obj);
+    if (!surface)
+        return false;
+
+    cairo_surface_flush(surface);
+
+    if (!gjs_cairo_check_status(cx, cairo_surface_status(surface), "surface"))
+        return false;
+
+    argv.rval().setUndefined();
+    return true;
+}
+
+GJS_JSAPI_RETURN_CONVENTION
+bool finish_func(JSContext* cx,
+                 unsigned argc,
+                 JS::Value* vp) {
+    GJS_GET_THIS(cx, argc, vp, argv, obj);
+
+    if (argc > 1) {
+        gjs_throw(cx, "Surface.finish() takes no arguments");
+        return false;
+    }
+
+    cairo_surface_t* surface = CairoSurface::for_js(cx, obj);
+    if (!surface)
+        return false;
+
+    cairo_surface_finish(surface);
+
+    if (!gjs_cairo_check_status(cx, cairo_surface_status(surface), "surface"))
+        return false;
+
+    argv.rval().setUndefined();
+    return true;
+}
+
+GJS_JSAPI_RETURN_CONVENTION
 bool CairoSurface::getType_func(JSContext* context, unsigned argc,
                                 JS::Value* vp) {
     GJS_GET_THIS(context, argc, vp, rec, obj);
@@ -125,8 +173,8 @@ static bool getDeviceOffset_func(JSContext* cx, unsigned argc, JS::Value* vp) {
     // cannot error
 
     JS::RootedValueArray<2> elements(cx);
-    elements[0].setNumber(x_offset);
-    elements[1].setNumber(y_offset);
+    elements[0].setNumber(JS::CanonicalizeNaN(x_offset));
+    elements[1].setNumber(JS::CanonicalizeNaN(y_offset));
     JS::RootedObject retval(cx, JS::NewArrayObject(cx, elements));
     if (!retval)
         return false;
@@ -175,8 +223,8 @@ static bool getDeviceScale_func(JSContext* cx, unsigned argc, JS::Value* vp) {
     // cannot error
 
     JS::RootedValueArray<2> elements(cx);
-    elements[0].setNumber(x_scale);
-    elements[1].setNumber(y_scale);
+    elements[0].setNumber(JS::CanonicalizeNaN(x_scale));
+    elements[1].setNumber(JS::CanonicalizeNaN(y_scale));
     JS::RootedObject retval(cx, JS::NewArrayObject(cx, elements));
     if (!retval)
         return false;
@@ -186,7 +234,8 @@ static bool getDeviceScale_func(JSContext* cx, unsigned argc, JS::Value* vp) {
 }
 
 const JSFunctionSpec CairoSurface::proto_funcs[] = {
-    // flush
+    JS_FN("flush", flush_func, 0, 0),
+    JS_FN("finish", finish_func, 0, 0),
     // getContent
     // getFontOptions
     JS_FN("getType", getType_func, 0, 0),
@@ -275,7 +324,7 @@ cairo_surface_t* CairoSurface::for_js(JSContext* cx,
         surface_wrapper, CairoSurface::POINTER);
 }
 
-[[nodiscard]] static bool surface_to_g_argument(
+[[nodiscard]] static bool surface_to_gi_argument(
     JSContext* context, JS::Value value, const char* arg_name,
     GjsArgumentType argument_type, GITransfer transfer, GjsArgumentFlags flags,
     GIArgument* arg) {
@@ -310,9 +359,9 @@ cairo_surface_t* CairoSurface::for_js(JSContext* cx,
 }
 
 GJS_JSAPI_RETURN_CONVENTION
-static bool surface_from_g_argument(JSContext* cx,
-                                    JS::MutableHandleValue value_p,
-                                    GIArgument* arg) {
+static bool surface_from_gi_argument(JSContext* cx,
+                                     JS::MutableHandleValue value_p,
+                                     GIArgument* arg) {
     JSObject* obj =
         CairoSurface::from_c_ptr(cx, gjs_arg_get<cairo_surface_t*>(arg));
     if (!obj)
@@ -330,8 +379,8 @@ static bool surface_release_argument(JSContext*, GITransfer transfer,
 }
 
 void gjs_cairo_surface_init(void) {
-    static GjsForeignInfo foreign_info = {surface_to_g_argument,
-                                          surface_from_g_argument,
+    static GjsForeignInfo foreign_info = {surface_to_gi_argument,
+                                          surface_from_gi_argument,
                                           surface_release_argument};
     gjs_struct_foreign_register("cairo", "Surface", &foreign_info);
 }

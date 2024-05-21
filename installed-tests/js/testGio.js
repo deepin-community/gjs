@@ -105,20 +105,32 @@ describe('Gio.Settings overrides', function () {
     });
 
     it("doesn't crash when specifying a schema ID that isn't installed", function () {
-        expect(() => new Gio.Settings({schema: 'com.example.ThisDoesntExist'}))
+        expect(() => new Gio.Settings({schemaId: 'com.example.ThisDoesntExist'}))
             .toThrowError(/schema/);
     });
 
     it("doesn't crash when forgetting to specify a schema path", function () {
-        expect(() => new Gio.Settings({schema: 'org.gnome.GjsTest.Sub'}))
+        expect(() => new Gio.Settings({schemaId: 'org.gnome.GjsTest.Sub'}))
             .toThrowError(/schema/);
     });
 
     it("doesn't crash when specifying conflicting schema paths", function () {
         expect(() => new Gio.Settings({
-            schema: 'org.gnome.GjsTest',
+            schemaId: 'org.gnome.GjsTest',
             path: '/conflicting/path/',
         })).toThrowError(/schema/);
+    });
+
+    it('can construct with a settings schema object', function () {
+        const source = Gio.SettingsSchemaSource.get_default();
+        const settingsSchema = source.lookup('org.gnome.GjsTest', false);
+        expect(() => new Gio.Settings({settingsSchema})).not.toThrow();
+    });
+
+    it('throws proper error message when settings schema is specified with a wrong type', function () {
+        expect(() => new Gio.Settings({
+            settings_schema: 'string.path',
+        }).toThrowError('is not of type Gio.SettingsSchema'));
     });
 
     describe('with existing schema', function () {
@@ -127,7 +139,7 @@ describe('Gio.Settings overrides', function () {
         let settings;
 
         beforeEach(function () {
-            settings = new Gio.Settings({schema: 'org.gnome.GjsTest'});
+            settings = new Gio.Settings({schemaId: 'org.gnome.GjsTest'});
         });
 
         it("doesn't crash when resetting a nonexistent key", function () {
@@ -216,6 +228,12 @@ describe('Gio.Settings overrides', function () {
             const sub = settings.get_child('sub');
             expect(sub.get_uint('marine')).toEqual(10);
         });
+    });
+});
+
+describe('Gio.content_type_set_mime_dirs', function () {
+    it('can be called with NULL argument', function () {
+        expect(() => Gio.content_type_set_mime_dirs(null)).not.toThrow();
     });
 });
 
@@ -309,6 +327,36 @@ describe('Gio.add_action_entries override', function () {
         ];
 
         expect(() => app.add_action_entries(entries)).toThrow();
+    });
+});
+
+describe('Gio.InputStream.prototype.createSyncIterator', function () {
+    it('iterates synchronously', function () {
+        const [file] = Gio.File.new_tmp(null);
+        file.replace_contents('hello ㊙ world', null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null);
+
+        let totalRead = 0;
+        for (const value of file.read(null).createSyncIterator(2)) {
+            expect(value).toBeInstanceOf(GLib.Bytes);
+            totalRead += value.get_size();
+        }
+
+        expect(totalRead).toBe(15);
+    });
+});
+
+describe('Gio.InputStream.prototype.createAsyncIterator', function () {
+    it('iterates asynchronously', async function () {
+        const [file] = Gio.File.new_tmp(null);
+        file.replace_contents('hello ㊙ world', null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null);
+
+        let totalRead = 0;
+        for await (const value of file.read(null).createAsyncIterator(2)) {
+            expect(value).toBeInstanceOf(GLib.Bytes);
+            totalRead += value.get_size();
+        }
+
+        expect(totalRead).toBe(15);
     });
 });
 

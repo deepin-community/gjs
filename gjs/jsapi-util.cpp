@@ -32,14 +32,14 @@
 #include <js/Object.h>    // for GetClass
 #include <js/PropertyAndElement.h>
 #include <js/RootingAPI.h>
-#include <js/Stack.h>  // for BuildStackString
 #include <js/String.h>
 #include <js/TypeDecls.h>
 #include <js/Value.h>
 #include <js/ValueArray.h>
 #include <jsapi.h>        // for JS_InstanceOf
 #include <jsfriendapi.h>  // for ProtoKeyToClass
-#include <mozilla/HashTable.h>  // for HashSet::AddPtr
+#include <jspubtd.h>      // for JSProto_InternalError, JSProto_SyntaxError
+#include <mozilla/ScopeExit.h>
 
 #include "gjs/atoms.h"
 #include "gjs/context-private.h"
@@ -262,6 +262,44 @@ static JSString* exception_to_string(JSContext* cx, JS::HandleValue exc) {
     return JS::ToString(cx, exc);
 }
 
+// Helper function: format the error's stack property.
+static std::string format_exception_stack(JSContext* cx, JS::HandleObject exc) {
+    JS::AutoSaveExceptionState saved_exc(cx);
+    auto restore =
+        mozilla::MakeScopeExit([&saved_exc]() { saved_exc.restore(); });
+
+    const GjsAtoms& atoms = GjsContextPrivate::atoms(cx);
+    std::ostringstream out;
+
+    // Check both the internal SavedFrame object and the stack property.
+    // GErrors will not have the former, and internal errors will not
+    // have the latter.
+    JS::RootedObject saved_frame{cx, JS::ExceptionStackOrNull(exc)};
+    if (saved_frame) {
+        JS::UniqueChars utf8_stack{format_saved_frame(cx, saved_frame)};
+        if (!utf8_stack)
+            return {};
+        out << '\n' << utf8_stack.get();
+        return out.str();
+    }
+
+    JS::RootedValue stack{cx};
+    if (!JS_GetPropertyById(cx, exc, atoms.stack(), &stack) || !stack.isString())
+        return {};
+
+    JS::RootedString str{cx, stack.toString()};
+    bool is_empty;
+    if (!JS_StringEqualsLiteral(cx, str, "", &is_empty) || is_empty)
+        return {};
+
+    JS::UniqueChars utf8_stack{JS_EncodeStringToUTF8(cx, str)};
+    if (!utf8_stack)
+        return {};
+
+    out << '\n' << utf8_stack.get();
+    return out.str();
+}
+
 // Helper function: format the file name, line number, and column number where a
 // SyntaxError occurred.
 static std::string format_syntax_error_location(JSContext* cx,
@@ -311,28 +349,8 @@ static std::string format_exception_with_cause(
     std::ostringstream out;
     const GjsAtoms& atoms = GjsContextPrivate::atoms(cx);
 
-    JS::UniqueChars utf8_stack;
-    // Check both the internal SavedFrame object and the stack property.
-    // GErrors will not have the former, and internal errors will not
-    // have the latter.
-    JS::RootedObject saved_frame(cx, JS::ExceptionStackOrNull(exc_obj));
-    JS::RootedString str(cx);
-    if (saved_frame) {
-        JS::BuildStackString(cx, nullptr, saved_frame, &str, 0);
-    } else {
-        JS::RootedValue stack(cx);
-        if (JS_GetPropertyById(cx, exc_obj, atoms.stack(), &stack) &&
-            stack.isString())
-            str = stack.toString();
-    }
-    if (str)
-        utf8_stack = JS_EncodeStringToUTF8(cx, str);
-    if (utf8_stack)
-        out << '\n' << utf8_stack.get();
-    JS_ClearPendingException(cx);
+    out << format_exception_stack(cx, exc_obj);
 
-    // COMPAT: use JS::GetExceptionCause, mozjs 91.6 and later, on Error objects
-    // in order to avoid side effects
     JS::RootedValue v_cause(cx);
     if (!JS_GetPropertyById(cx, exc_obj, atoms.cause(), &v_cause))
         JS_ClearPendingException(cx);
@@ -349,7 +367,7 @@ static std::string format_exception_with_cause(
             return out.str();  // out of memory, just stop here
     }
 
-    out << "Caused by: ";
+    out << "\nCaused by: ";
     JS::RootedString exc_str(cx, exception_to_string(cx, v_cause));
     if (exc_str) {
         JS::UniqueChars utf8_exception = JS_EncodeStringToUTF8(cx, exc_str);
@@ -395,7 +413,8 @@ static std::string format_exception_log_message(JSContext* cx,
         // file name, line number, and column number from the exception.
         // We assume that syntax errors have no cause property, and are not the
         // cause of other exceptions, so no recursion.
-        out << format_syntax_error_location(cx, exc_obj);
+        out << format_syntax_error_location(cx, exc_obj)
+            << format_exception_stack(cx, exc_obj);
         return out.str();
     }
 
@@ -557,56 +576,18 @@ gjs_maybe_gc (JSContext *context)
     gjs_gc_if_needed(context);
 }
 
-/**
- * gjs_get_import_global:
- * @context: a #JSContext
- *
- * Gets the "import global" for the context's runtime. The import
- * global object is the global object for the context. It is used
- * as the root object for the scope of modules loaded by GJS in this
- * runtime, and should also be used as the globals 'obj' argument passed
- * to JS_InitClass() and the parent argument passed to JS_ConstructObject()
- * when creating a native classes that are shared between all contexts using
- * the runtime. (The standard JS classes are not shared, but we share
- * classes such as GObject proxy classes since objects of these classes can
- * easily migrate between contexts and having different classes depending
- * on the context where they were first accessed would be confusing.)
- *
- * Return value: the "import global" for the context's
- *  runtime. Will never return %NULL while GJS has an active context
- *  for the runtime.
- */
-JSObject* gjs_get_import_global(JSContext* cx) {
-    return GjsContextPrivate::from_cx(cx)->global();
-}
-
-/**
- * gjs_get_internal_global:
- *
- * @brief Gets the "internal global" for the context's runtime. The internal
- * global object is the global object used for all "internal" JavaScript
- * code (e.g. the module loader) that should not be accessible from users'
- * code.
- *
- * @param cx a #JSContext
- *
- * @returns the "internal global" for the context's
- *  runtime. Will never return %NULL while GJS has an active context
- *  for the runtime.
- */
-JSObject* gjs_get_internal_global(JSContext* cx) {
-    return GjsContextPrivate::from_cx(cx)->internal_global();
-}
-
 const char* gjs_explain_gc_reason(JS::GCReason reason) {
     if (JS::InternalGCReason(reason))
         return JS::ExplainGCReason(reason);
 
     static const char* reason_strings[] = {
+        // clang-format off
         "RSS above threshold",
         "GjsContext disposed",
         "Big Hammer hit",
         "gjs_context_gc() called",
+        "Memory usage is low",
+        // clang-format on
     };
     static_assert(G_N_ELEMENTS(reason_strings) == Gjs::GCReason::N_REASONS,
                   "Explanations must match the values in Gjs::GCReason");

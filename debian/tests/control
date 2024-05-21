@@ -1,6 +1,12 @@
 Tests: build
 Restrictions: superficial
-Depends: libgjs-dev, build-essential
+Depends: build-essential,
+         libgjs-dev
 
 Tests: installed-tests
-Depends: dbus-daemon, dbus-x11, gjs-tests, gnome-desktop-testing, xauth, xvfb
+Depends: dbus-daemon,
+         dbus-x11,
+         gjs-tests,
+         gnome-desktop-testing,
+         xauth,
+         xvfb

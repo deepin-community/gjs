@@ -129,32 +129,25 @@ static GParamSpec *properties[PROP_N] = { NULL, };
  */
 [[nodiscard]] static char* find_diverging_child_components(GFile* child,
                                                            GFile* parent) {
-    g_object_ref(parent);
-    GFile *ancestor = parent;
-    while (ancestor != NULL) {
+    GjsAutoUnref<GFile> ancestor(parent, GjsAutoTakeOwnership());
+    while (ancestor) {
         char *relpath = g_file_get_relative_path(ancestor, child);
-        if (relpath) {
-            g_object_unref(ancestor);
+        if (relpath)
             return relpath;
-        }
-        GFile *new_ancestor = g_file_get_parent(ancestor);
-        g_object_unref(ancestor);
-        ancestor = new_ancestor;
+
+        ancestor = g_file_get_parent(ancestor);
     }
 
     /* This is a special case of getting the URI below. The difference is that
      * this gives you a regular path name; getting it through the URI would
      * give a URI-encoded path (%20 for spaces, etc.) */
-    GFile *root = g_file_new_for_path("/");
-    char *child_path = g_file_get_relative_path(root, child);
-    g_object_unref(root);
+    GjsAutoUnref<GFile> root = g_file_new_for_path("/");
+    char* child_path = g_file_get_relative_path(root, child);
     if (child_path)
         return child_path;
 
-    char *child_uri = g_file_get_uri(child);
-    char *stripped_uri = strip_uri_scheme(child_uri);
-    g_free(child_uri);
-    return stripped_uri;
+    GjsAutoChar child_uri = g_file_get_uri(child);
+    return strip_uri_scheme(child_uri);
 }
 
 [[nodiscard]] static bool filename_has_coverage_prefixes(GjsCoverage* self,
@@ -280,15 +273,14 @@ void
 gjs_coverage_write_statistics(GjsCoverage *coverage)
 {
     auto priv = static_cast<GjsCoveragePrivate *>(gjs_coverage_get_instance_private(coverage));
-    GError *error = nullptr;
+    GjsAutoError error;
 
     auto cx = static_cast<JSContext *>(gjs_context_get_native_context(priv->context));
-    JSAutoRealm ar(cx, gjs_get_import_global(cx));
+    Gjs::AutoMainRealm ar{cx};
 
     GjsAutoUnref<GFile> output_file = write_statistics_internal(coverage, cx, &error);
     if (!output_file) {
         g_critical("Error writing coverage data: %s", error->message);
-        g_error_free(error);
         return;
     }
 
@@ -318,21 +310,20 @@ bootstrap_coverage(GjsCoverage *coverage)
 {
     GjsCoveragePrivate *priv = (GjsCoveragePrivate *) gjs_coverage_get_instance_private(coverage);
 
-    JSContext *context = (JSContext *) gjs_context_get_native_context(priv->context);
+    auto* gjs = GjsContextPrivate::from_object(priv->context);
+    JSContext* context = gjs->context();
 
-    JSObject *debuggee = gjs_get_import_global(context);
     JS::RootedObject debugger_global(
         context, gjs_create_global_object(context, GjsGlobalType::DEBUGGER));
     {
         JSAutoRealm ar(context, debugger_global);
-        JS::RootedObject debuggeeWrapper(context, debuggee);
-        if (!JS_WrapObject(context, &debuggeeWrapper))
+        JS::RootedObject debuggee{context, gjs->global()};
+        if (!JS_WrapObject(context, &debuggee))
             return false;
 
-        const GjsAtoms& atoms = GjsContextPrivate::atoms(context);
-        JS::RootedValue debuggeeWrapperValue(context, JS::ObjectValue(*debuggeeWrapper));
-        if (!JS_SetPropertyById(context, debugger_global, atoms.debuggee(),
-                                debuggeeWrapperValue) ||
+        JS::RootedValue v_debuggee{context, JS::ObjectValue(*debuggee)};
+        if (!JS_SetPropertyById(context, debugger_global,
+                                gjs->atoms().debuggee(), v_debuggee) ||
             !gjs_define_global_properties(context, debugger_global,
                                           GjsGlobalType::DEBUGGER,
                                           "GJS coverage", "coverage"))
@@ -358,7 +349,7 @@ gjs_coverage_constructed(GObject *object)
 
     if (!bootstrap_coverage(coverage)) {
         JSContext *context = static_cast<JSContext *>(gjs_context_get_native_context(priv->context));
-        JSAutoRealm ar(context, gjs_get_import_global(context));
+        Gjs::AutoMainRealm ar{context};
         gjs_log_exception(context);
     }
 }

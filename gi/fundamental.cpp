@@ -12,11 +12,13 @@
 #include <js/Class.h>
 #include <js/ErrorReport.h>  // for JS_ReportOutOfMemory
 #include <js/GCHashTable.h>  // for WeakCache
+#include <js/HashTable.h>    // for DefaultHasher via WeakCache
 #include <js/Object.h>       // for GetClass
 #include <js/PropertyAndElement.h>
 #include <js/RootingAPI.h>
 #include <js/TypeDecls.h>
 #include <js/Utility.h>  // for UniqueChars
+#include <js/Value.h>
 #include <jsapi.h>       // for InformalValueTypeName, JS_NewObjectWithGivenP...
 #include <mozilla/HashTable.h>
 
@@ -25,6 +27,7 @@
 #include "gi/function.h"
 #include "gi/fundamental.h"
 #include "gi/repo.h"
+#include "gi/value.h"
 #include "gi/wrapperutils.h"
 #include "gjs/atoms.h"
 #include "gjs/context-private.h"
@@ -197,7 +200,7 @@ bool FundamentalInstance::invoke_constructor(JSContext* context,
 bool FundamentalInstance::constructor_impl(JSContext* cx,
                                            JS::HandleObject object,
                                            const JS::CallArgs& argv) {
-    GArgument ret_value;
+    GIArgument ret_value;
     GITypeInfo return_info;
 
     if (!invoke_constructor(cx, object, argv, &ret_value) ||
@@ -207,7 +210,7 @@ bool FundamentalInstance::constructor_impl(JSContext* cx,
     GICallableInfo* constructor_info = get_prototype()->constructor_info();
     g_callable_info_load_return_type(constructor_info, &return_info);
 
-    return gjs_g_argument_release(
+    return gjs_gi_argument_release(
         cx, g_callable_info_get_caller_owns(constructor_info), &return_info,
         &ret_value);
 }
@@ -482,11 +485,11 @@ bool FundamentalBase::to_gvalue(JSContext* cx, JS::HandleObject obj,
             return true;
         } else if (g_value_type_transformable(instance->gtype(),
                                               G_VALUE_TYPE(gvalue))) {
-            GValue instance_value = {0};
+            Gjs::AutoGValue instance_value;
             g_value_init(&instance_value, instance->gtype());
             g_value_set_instance(&instance_value, instance->m_ptr);
-            g_value_transform(&instance_value, gvalue);
-            return true;
+            if (g_value_transform(&instance_value, gvalue))
+                return true;
         }
 
         gjs_throw(cx,

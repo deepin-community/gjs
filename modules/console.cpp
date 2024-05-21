@@ -34,6 +34,7 @@
 #include <js/CompileOptions.h>
 #include <js/ErrorReport.h>
 #include <js/Exception.h>
+#include <js/GlobalObject.h>  // for CurrentGlobalOrNull
 #include <js/PropertyAndElement.h>
 #include <js/RootingAPI.h>
 #include <js/SourceText.h>
@@ -86,12 +87,18 @@ public:
         JS::PrintError(stderr, report, /* reportWarnings = */ false);
 
         if (exnStack.stack()) {
-            GjsAutoChar stack_str =
-                gjs_format_stack_trace(m_cx, exnStack.stack());
-            if (!stack_str)
+            JS::UniqueChars stack_str{
+                format_saved_frame(m_cx, exnStack.stack(), 2)};
+            if (!stack_str) {
                 g_printerr("(Unable to print stack trace)\n");
-            else
-                g_printerr("%s", stack_str.get());
+            } else {
+                GjsAutoChar encoded_stack_str{g_filename_from_utf8(
+                    stack_str.get(), -1, nullptr, nullptr, nullptr)};
+                if (!encoded_stack_str)
+                    g_printerr("(Unable to print stack trace)\n");
+                else
+                    g_printerr("%s", stack_str.get());
+            }
         }
 
         JS_ClearPendingException(m_cx);
@@ -223,11 +230,11 @@ gjs_console_interact(JSContext *context,
                      JS::Value *vp)
 {
     JS::CallArgs argv = JS::CallArgsFromVp(argc, vp);
-    bool eof, exit_warning;
-    JS::RootedObject global(context, gjs_get_import_global(context));
+    volatile bool eof, exit_warning;  // accessed after setjmp()
+    JS::RootedObject global{context, JS::CurrentGlobalOrNull(context)};
     char* temp_buf;
-    int lineno;
-    int startline;
+    volatile int lineno;     // accessed after setjmp()
+    volatile int startline;  // accessed after setjmp()
 
 #ifndef HAVE_READLINE_READLINE_H
     int rl_end = 0;  // nonzero if using readline and any text is typed in

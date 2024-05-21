@@ -16,6 +16,8 @@
 #include <glib.h>
 
 #include <js/GCAPI.h>
+#include <js/HeapAPI.h>     // for ExposeObjectToActiveJS, GetGCThingZone
+#include <js/RootingAPI.h>  // for SafelyInitialized
 #include <js/TracingAPI.h>
 #include <js/TypeDecls.h>
 
@@ -75,17 +77,6 @@ struct GjsHeapOperation<JSObject *> {
             return;
         if (!JS::RuntimeHeapIsCollecting())
             JS::ExposeObjectToActiveJS(obj);
-    }
-};
-
-template <>
-struct GjsHeapOperation<JSFunction*> {
-    static void expose_to_js(const JS::Heap<JSFunction*>& thing) {
-        JSFunction* func = thing.unbarrieredGet();
-        if (!func || !JS::GetGCThingZone(JS::GCCellPtr(func)))
-            return;
-        if (!JS::RuntimeHeapIsCollecting())
-            js::gc::ExposeGCThingToActiveJS(JS::GCCellPtr(func));
     }
 };
 

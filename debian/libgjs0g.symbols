@@ -22,6 +22,7 @@ libgjs.so.0 libgjs0g #MINVER#
  gjs_context_new_with_search_path@Base 1.63.90
  gjs_context_print_stack_stderr@Base 1.63.90
  gjs_context_register_module@Base 1.67.2
+ gjs_context_run_in_realm@Base 1.77.90
  gjs_context_set_argv@Base 1.67.2
  gjs_context_setup_debugger_console@Base 1.63.90
  gjs_coverage_enable@Base 1.65.90

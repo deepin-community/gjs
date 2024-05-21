@@ -4,10 +4,12 @@
 
 #include <config.h>
 
+#include <stddef.h>  // for NULL, size_t
 #include <stdint.h>
-#include <stdlib.h>  // for exit
 
+#include <limits>
 #include <memory>  // for unique_ptr
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -18,6 +20,7 @@
 #include <glib.h>
 
 #include <js/Array.h>
+#include <js/CallAndConstruct.h>  // for IsCallable
 #include <js/CallArgs.h>
 #include <js/Class.h>
 #include <js/ErrorReport.h>  // for JS_ReportOutOfMemory
@@ -27,12 +30,12 @@
 #include <js/PropertySpec.h>
 #include <js/Realm.h>  // for GetRealmFunctionPrototype
 #include <js/RootingAPI.h>
-#include <js/String.h>
 #include <js/TypeDecls.h>
 #include <js/Value.h>
 #include <js/ValueArray.h>
 #include <js/Warnings.h>
 #include <jsapi.h>        // for HandleValueArray
+#include <jsfriendapi.h>  // for JS_GetObjectFunction
 #include <jspubtd.h>      // for JSProtoKey
 
 #include "gi/arg-cache.h"
@@ -45,7 +48,6 @@
 #include "gi/object.h"
 #include "gi/utils-inl.h"
 #include "gjs/context-private.h"
-#include "gjs/context.h"
 #include "gjs/global.h"
 #include "gjs/jsapi-util.h"
 #include "gjs/macros.h"
@@ -129,8 +131,7 @@ class Function : public CWrapper<Function> {
     static JSObject* inherit_builtin_function(JSContext* cx, JSProtoKey) {
         JS::RootedObject builtin_function_proto(
             cx, JS::GetRealmFunctionPrototype(cx));
-        return JS_NewObjectWithGivenProto(cx, &Function::klass,
-                                          builtin_function_proto);
+        return JS_NewObjectWithGivenProto(cx, nullptr, builtin_function_proto);
     }
 
     static const JSClassOps class_ops;
@@ -189,12 +190,10 @@ static inline void set_ffi_arg(void* result, GIArgument* value) {
     }
 }
 
-static void
-set_return_ffi_arg_from_giargument (GITypeInfo  *ret_type,
-                                    void        *result,
-                                    GIArgument  *return_value)
-{
-    // Be consistent with gjs_value_to_g_argument()
+static void set_return_ffi_arg_from_gi_argument(GITypeInfo* ret_type,
+                                                void* result,
+                                                GIArgument* return_value) {
+    // Be consistent with gjs_value_to_gi_argument()
     switch (g_type_info_get_tag(ret_type)) {
     case GI_TYPE_TAG_VOID:
         g_assert_not_reached();
@@ -227,10 +226,8 @@ set_return_ffi_arg_from_giargument (GITypeInfo  *ret_type,
         break;
     case GI_TYPE_TAG_INTERFACE:
         {
-            GIInfoType interface_type;
-
             GjsAutoBaseInfo interface_info(g_type_info_get_interface(ret_type));
-            interface_type = g_base_info_get_type(interface_info);
+            GIInfoType interface_type = interface_info.type();
 
             if (interface_type == GI_INFO_TYPE_ENUM ||
                 interface_type == GI_INFO_TYPE_FLAGS)
@@ -268,13 +265,21 @@ set_return_ffi_arg_from_giargument (GITypeInfo  *ret_type,
 }
 
 void GjsCallbackTrampoline::warn_about_illegal_js_callback(const char* when,
-                                                           const char* reason) {
-    g_critical("Attempting to run a JS callback %s. This is most likely caused "
-               "by %s. Because it would crash the application, it has been "
-               "blocked.", when, reason);
-    if (m_info)
-        g_critical("The offending callback was %s()%s.", m_info.name(),
-                   m_is_vfunc ? ", a vfunc" : "");
+                                                           const char* reason,
+                                                           bool        dump_stack) {
+    std::ostringstream message;
+
+    message << "Attempting to run a JS callback " << when << ". "
+            << "This is most likely caused by " << reason << ". "
+            << "Because it would crash the application, it has been blocked.";
+    if (m_info) {
+        message << "\nThe offending callback was " << m_info.name() << "()"
+                << (m_is_vfunc ? ", a vfunc." : ".");
+    }
+    if (dump_stack) {
+        message << "\n" << gjs_dumpstack_string();
+    }
+    g_critical("%s", message.str().c_str());
 }
 
 /* This is our main entry point for ffi_closure callbacks.
@@ -287,12 +292,20 @@ void GjsCallbackTrampoline::warn_about_illegal_js_callback(const char* when,
 void GjsCallbackTrampoline::callback_closure(GIArgument** args, void* result) {
     GITypeInfo ret_type;
 
+    // Fill in the result with some hopefully neutral value
+    g_callable_info_load_return_type(m_info, &ret_type);
+    if (g_type_info_get_tag(&ret_type) != GI_TYPE_TAG_VOID) {
+        GIArgument argument = {};
+        gjs_gi_argument_init_default(&ret_type, &argument);
+        set_return_ffi_arg_from_gi_argument(&ret_type, result, &argument);
+    }
+
     if (G_UNLIKELY(!is_valid())) {
         warn_about_illegal_js_callback(
             "during shutdown",
             "destroying a Clutter actor or GTK widget with ::destroy signal "
-            "connected, or using the destroy(), dispose(), or remove() vfuncs");
-        gjs_dumpstack();
+            "connected, or using the destroy(), dispose(), or remove() vfuncs",
+            true);
         return;
     }
 
@@ -302,20 +315,21 @@ void GjsCallbackTrampoline::callback_closure(GIArgument** args, void* result) {
         warn_about_illegal_js_callback(
             "during garbage collection",
             "destroying a Clutter actor or GTK widget with ::destroy signal "
-            "connected, or using the destroy(), dispose(), or remove() vfuncs");
-        gjs_dumpstack();
+            "connected, or using the destroy(), dispose(), or remove() vfuncs",
+            true);
         return;
     }
 
     if (G_UNLIKELY(!gjs->is_owner_thread())) {
         warn_about_illegal_js_callback("on a different thread",
-                                       "an API not intended to be used in JS");
+                                       "an API not intended to be used in JS",
+                                       false);
         return;
     }
 
-    JSAutoRealm ar(context, JS_GetFunctionObject(callable()));
+    JSAutoRealm ar(context, callable());
 
-    int n_args = m_param_types.size();
+    int n_args = g_callable_info_get_n_args(m_info);
     g_assert(n_args >= 0);
 
     struct AutoCallbackData {
@@ -340,15 +354,17 @@ void GjsCallbackTrampoline::callback_closure(GIArgument** args, void* result) {
     AutoCallbackData callback_data(this, gjs);
     JS::RootedObject this_object(context);
     int c_args_offset = 0;
+    GObject* gobj = nullptr;
     if (m_is_vfunc) {
-        GObject* gobj = G_OBJECT(gjs_arg_get<GObject*>(args[0]));
+        gobj = G_OBJECT(gjs_arg_get<GObject*>(args[0]));
         if (gobj) {
             this_object = ObjectInstance::wrapper_from_gobject(context, gobj);
             if (!this_object) {
                 if (g_object_get_qdata(gobj, ObjectBase::disposed_quark())) {
                     warn_about_illegal_js_callback(
                         "on disposed object",
-                        "using the destroy(), dispose(), or remove() vfuncs");
+                        "using the destroy(), dispose(), or remove() vfuncs",
+                        false);
                 }
                 gjs_log_exception(context);
                 return;
@@ -362,34 +378,24 @@ void GjsCallbackTrampoline::callback_closure(GIArgument** args, void* result) {
 
     JS::RootedValue rval(context);
 
-    g_callable_info_load_return_type(m_info, &ret_type);
-
-    if (!callback_closure_inner(context, this_object, &rval, args, &ret_type,
-                                n_args, c_args_offset, result)) {
+    if (!callback_closure_inner(context, this_object, gobj, &rval, args,
+                                &ret_type, n_args, c_args_offset, result)) {
         if (!JS_IsExceptionPending(context)) {
             // "Uncatchable" exception thrown, we have to exit. We may be in a
             // main loop, or maybe not, but there's no way to tell, so we have
             // to exit here instead of propagating the exception back to the
             // original calling JS code.
             uint8_t code;
-            if (gjs->should_exit(&code)) {
-                gjs->warn_about_unhandled_promise_rejections();
-                exit(code);
-            }
+            if (gjs->should_exit(&code))
+                gjs->exit_immediately(code);
 
             // Some other uncatchable exception, e.g. out of memory
-            JSFunction* fn = callable();
-            g_error("Function %s (%s.%s) terminated with uncatchable exception",
-                    gjs_debug_string(JS_GetFunctionDisplayId(fn)).c_str(),
-                    m_info.ns(), m_info.name());
-        }
-
-        // Fill in the result with some hopefully neutral value
-        if (g_type_info_get_tag(&ret_type) != GI_TYPE_TAG_VOID) {
-            GIArgument argument = {};
-            g_callable_info_load_return_type(m_info, &ret_type);
-            gjs_gi_argument_init_default(&ret_type, &argument);
-            set_return_ffi_arg_from_giargument(&ret_type, result, &argument);
+            JSFunction* fn = JS_GetObjectFunction(callable());
+            std::string descr =
+                fn ? "function " + gjs_debug_string(JS_GetFunctionDisplayId(fn))
+                   : "callable object " + gjs_debug_object(callable());
+            g_error("Call to %s (%s.%s) terminated with uncatchable exception",
+                    descr.c_str(), m_info.ns(), m_info.name());
         }
 
         // If the callback has a GError** argument, then make a GError from the
@@ -419,7 +425,7 @@ inline GIArgument* get_argument_for_arg_info(GIArgInfo* arg_info,
 }
 
 bool GjsCallbackTrampoline::callback_closure_inner(
-    JSContext* context, JS::HandleObject this_object,
+    JSContext* context, JS::HandleObject this_object, GObject* gobject,
     JS::MutableHandleValue rval, GIArgument** args, GITypeInfo* ret_type,
     int n_args, int c_args_offset, void* result) {
     int n_outargs = 0;
@@ -428,7 +434,9 @@ bool GjsCallbackTrampoline::callback_closure_inner(
     if (!jsargs.reserve(n_args))
         g_error("Unable to reserve space for vector");
 
-    bool ret_type_is_void = g_type_info_get_tag(ret_type) == GI_TYPE_TAG_VOID;
+    GITypeTag ret_tag = g_type_info_get_tag(ret_type);
+    bool ret_type_is_void = ret_tag == GI_TYPE_TAG_VOID;
+    bool in_args_to_cleanup = false;
 
     for (int i = 0, n_jsargs = 0; i < n_args; i++) {
         GIArgInfo arg_info;
@@ -450,6 +458,9 @@ bool GjsCallbackTrampoline::callback_closure_inner(
         if (g_arg_info_get_direction(&arg_info) == GI_DIRECTION_INOUT)
             n_outargs++;
 
+        if (g_arg_info_get_ownership_transfer(&arg_info) != GI_TRANSFER_NOTHING)
+            in_args_to_cleanup = m_scope != GI_SCOPE_TYPE_FOREVER;
+
         param_type = m_param_types[i];
 
         switch (param_type) {
@@ -463,7 +474,7 @@ bool GjsCallbackTrampoline::callback_closure_inner(
                 g_callable_info_load_arg(m_info, array_length_pos,
                                          &array_length_arg);
                 g_arg_info_load_type(&array_length_arg, &arg_type_info);
-                size_t length = gjs_g_argument_get_array_length(
+                size_t length = gjs_gi_argument_get_array_length(
                     g_type_info_get_tag(&arg_type_info),
                     args[array_length_pos + c_args_offset]);
 
@@ -472,6 +483,7 @@ bool GjsCallbackTrampoline::callback_closure_inner(
 
                 if (!gjs_value_from_explicit_array(
                         context, jsargs[n_jsargs++], &type_info,
+                        g_arg_info_get_ownership_transfer(&arg_info),
                         args[i + c_args_offset], length))
                     return false;
                 break;
@@ -485,8 +497,8 @@ bool GjsCallbackTrampoline::callback_closure_inner(
                     !g_arg_info_is_caller_allocates(&arg_info))
                     arg = *reinterpret_cast<GIArgument**>(arg);
 
-                if (!gjs_value_from_g_argument(context, jsargs[n_jsargs++],
-                                               &type_info, arg, false))
+                if (!gjs_value_from_gi_argument(context, jsargs[n_jsargs++],
+                                                &type_info, arg, false))
                     return false;
                 break;
             }
@@ -512,12 +524,12 @@ bool GjsCallbackTrampoline::callback_closure_inner(
         transfer = g_callable_info_get_caller_owns(m_info);
         /* non-void return value, no out args. Should
          * be a single return value. */
-        if (!gjs_value_to_g_argument(context, rval, ret_type, "callback",
-                                     GJS_ARGUMENT_RETURN_VALUE, transfer,
-                                     GjsArgumentFlags::MAY_BE_NULL, &argument))
+        if (!gjs_value_to_gi_argument(context, rval, ret_type, "callback",
+                                      GJS_ARGUMENT_RETURN_VALUE, transfer,
+                                      GjsArgumentFlags::MAY_BE_NULL, &argument))
             return false;
 
-        set_return_ffi_arg_from_giargument(ret_type, result, &argument);
+        set_return_ffi_arg_from_gi_argument(ret_type, result, &argument);
     } else if (n_outargs == 1 && ret_type_is_void) {
         /* void return value, one out args. Should
          * be a single return value. */
@@ -541,12 +553,14 @@ bool GjsCallbackTrampoline::callback_closure_inner(
             return false;
 
         if (!is_array) {
-            JSFunction* fn = callable();
+            JSFunction* fn = JS_GetObjectFunction(callable());
+            std::string descr =
+                fn ? "function " + gjs_debug_string(JS_GetFunctionDisplayId(fn))
+                   : "callable object " + gjs_debug_object(callable());
             gjs_throw(context,
-                      "Function %s (%s.%s) returned unexpected value, "
-                      "expecting an Array",
-                      gjs_debug_string(JS_GetFunctionDisplayId(fn)).c_str(),
-                      m_info.ns(), m_info.name());
+                      "Call to %s (%s.%s) returned unexpected value, expecting "
+                      "an Array",
+                      descr.c_str(), m_info.ns(), m_info.name());
             return false;
         }
 
@@ -563,13 +577,28 @@ bool GjsCallbackTrampoline::callback_closure_inner(
             if (!JS_GetElement(context, out_array, elem_idx, &elem))
                 return false;
 
-            if (!gjs_value_to_g_argument(context, elem, ret_type, "callback",
-                                         GJS_ARGUMENT_RETURN_VALUE, transfer,
-                                         GjsArgumentFlags::MAY_BE_NULL,
-                                         &argument))
+            if (!gjs_value_to_gi_argument(context, elem, ret_type, "callback",
+                                          GJS_ARGUMENT_RETURN_VALUE, transfer,
+                                          GjsArgumentFlags::MAY_BE_NULL,
+                                          &argument))
                 return false;
 
-            set_return_ffi_arg_from_giargument(ret_type, result, &argument);
+            if ((ret_tag == GI_TYPE_TAG_FILENAME ||
+                 ret_tag == GI_TYPE_TAG_UTF8) &&
+                transfer == GI_TRANSFER_NOTHING) {
+                // We duplicated the string so not to leak we need to both
+                // ensure that the string is bound to the object lifetime or
+                // created once
+                if (gobject) {
+                    ObjectInstance::associate_string(
+                        gobject, gjs_arg_get<char*>(&argument));
+                } else {
+                    GjsAutoChar str = gjs_arg_steal<char*>(&argument);
+                    gjs_arg_set<const char*>(&argument, g_intern_string(str));
+                }
+            }
+
+            set_return_ffi_arg_from_gi_argument(ret_type, result, &argument);
 
             elem_idx++;
         }
@@ -593,15 +622,67 @@ bool GjsCallbackTrampoline::callback_closure_inner(
         }
     }
 
+    if (!in_args_to_cleanup)
+        return true;
+
+    for (int i = 0; i < n_args; i++) {
+        GIArgInfo arg_info;
+        g_callable_info_load_arg(m_info, i, &arg_info);
+        GITransfer transfer = g_arg_info_get_ownership_transfer(&arg_info);
+
+        if (transfer == GI_TRANSFER_NOTHING)
+            continue;
+
+        if (g_arg_info_get_direction(&arg_info) != GI_DIRECTION_IN)
+            continue;
+
+        GIArgument* arg = args[i + c_args_offset];
+        if (m_scope == GI_SCOPE_TYPE_CALL) {
+            GITypeInfo type_info;
+            g_arg_info_load_type(&arg_info, &type_info);
+
+            if (!gjs_gi_argument_release(context, transfer, &type_info, arg))
+                return false;
+
+            continue;
+        }
+
+        struct InvalidateData {
+            GIArgInfo arg_info;
+            GIArgument arg;
+        };
+
+        auto* data = new InvalidateData({arg_info, *arg});
+        g_closure_add_invalidate_notifier(
+            this, data, [](void* invalidate_data, GClosure* c) {
+                auto* self = static_cast<GjsCallbackTrampoline*>(c);
+                std::unique_ptr<InvalidateData> data(
+                    static_cast<InvalidateData*>(invalidate_data));
+                GITransfer transfer =
+                    g_arg_info_get_ownership_transfer(&data->arg_info);
+
+                GITypeInfo type_info;
+                g_arg_info_load_type(&data->arg_info, &type_info);
+                if (!gjs_gi_argument_release(self->context(), transfer,
+                                             &type_info, &data->arg)) {
+                    gjs_throw(self->context(),
+                              "Impossible to release closure argument '%s'",
+                              g_base_info_get_name(&data->arg_info));
+                }
+            });
+    }
+
     return true;
 }
 
 GjsCallbackTrampoline* GjsCallbackTrampoline::create(
-    JSContext* cx, JS::HandleFunction function, GICallableInfo* callable_info,
+    JSContext* cx, JS::HandleObject callable, GICallableInfo* callable_info,
     GIScopeType scope, bool has_scope_object, bool is_vfunc) {
-    g_assert(function);
+    g_assert(JS::IsCallable(callable) &&
+             "tried to create a callback trampoline for a non-callable object");
+
     auto* trampoline = new GjsCallbackTrampoline(
-        cx, function, callable_info, scope, has_scope_object, is_vfunc);
+        cx, callable, callable_info, scope, has_scope_object, is_vfunc);
 
     if (!trampoline->initialize()) {
         g_closure_unref(trampoline);
@@ -615,17 +696,18 @@ decltype(GjsCallbackTrampoline::s_forever_closure_list)
     GjsCallbackTrampoline::s_forever_closure_list;
 
 GjsCallbackTrampoline::GjsCallbackTrampoline(
-    JSContext* cx, JS::HandleFunction function, GICallableInfo* callable_info,
+    JSContext* cx, JS::HandleObject callable, GICallableInfo* callable_info,
     GIScopeType scope, bool has_scope_object, bool is_vfunc)
     // The rooting rule is:
     // - notify callbacks in GObject methods are traced from the scope object
     // - async and call callbacks, and other notify callbacks, are rooted
     // - vfuncs are traced from the GObject prototype
-    : Closure(cx, function,
+    : Closure(cx, callable,
               scope != GI_SCOPE_TYPE_NOTIFIED || !has_scope_object,
               g_base_info_get_name(callable_info)),
       m_info(callable_info, GjsAutoTakeOwnership()),
-      m_param_types(g_callable_info_get_n_args(callable_info), {}),
+      m_param_types(std::make_unique<GjsParamType[]>(
+          g_callable_info_get_n_args(callable_info))),
       m_scope(scope),
       m_is_vfunc(is_vfunc) {
     add_finalize_notifier<GjsCallbackTrampoline>();
@@ -672,7 +754,8 @@ bool GjsCallbackTrampoline::initialize() {
 
     /* Analyze param types and directions, similarly to
      * init_cached_function_data */
-    for (size_t i = 0; i < m_param_types.size(); i++) {
+    int n_param_types = g_callable_info_get_n_args(m_info);
+    for (int i = 0; i < n_param_types; i++) {
         GIDirection direction;
         GIArgInfo arg_info;
         GITypeInfo type_info;
@@ -693,11 +776,9 @@ bool GjsCallbackTrampoline::initialize() {
         }
 
         if (type_tag == GI_TYPE_TAG_INTERFACE) {
-            GIInfoType interface_type;
-
             GjsAutoBaseInfo interface_info =
                 g_type_info_get_interface(&type_info);
-            interface_type = g_base_info_get_type(interface_info);
+            GIInfoType interface_type = interface_info.type();
             if (interface_type == GI_INFO_TYPE_CALLBACK) {
                 gjs_throw(context(),
                           "%s %s accepts another callback as a parameter. This "
@@ -712,8 +793,7 @@ bool GjsCallbackTrampoline::initialize() {
                 if (array_length_pos < 0)
                     continue;
 
-                if (static_cast<size_t>(array_length_pos) <
-                    m_param_types.size()) {
+                if (array_length_pos < n_param_types) {
                     GIArgInfo length_arg_info;
 
                     g_callable_info_load_arg(m_info, array_length_pos,
@@ -755,13 +835,13 @@ std::string Gjs::Function::format_name() {
 
 namespace Gjs {
 
-static void* get_return_ffi_pointer_from_giargument(
-    GITypeInfo* return_type, GIFFIReturnValue* return_value) {
-    // This should be the inverse of gi_type_info_extract_ffi_return_value().
-    if (!return_type)
-        return nullptr;
-
-    switch (g_type_info_get_tag(return_type)) {
+static void* get_return_ffi_pointer_from_gi_argument(
+    GITypeTag tag, GITypeInfo* return_type, GIFFIReturnValue* return_value) {
+    if (return_type && g_type_info_is_pointer(return_type))
+        return &gjs_arg_member<void*>(return_value);
+    switch (tag) {
+        case GI_TYPE_TAG_VOID:
+            return nullptr;
         case GI_TYPE_TAG_INT8:
             return &gjs_arg_member<int8_t>(return_value);
         case GI_TYPE_TAG_INT16:
@@ -787,9 +867,12 @@ static void* get_return_ffi_pointer_from_giargument(
         case GI_TYPE_TAG_DOUBLE:
             return &gjs_arg_member<double>(return_value);
         case GI_TYPE_TAG_INTERFACE: {
+            if (!return_type)
+                return nullptr;
+
             GjsAutoBaseInfo info = g_type_info_get_interface(return_type);
 
-            switch (g_base_info_get_type(info)) {
+            switch (info.type()) {
                 case GI_INFO_TYPE_ENUM:
                 case GI_INFO_TYPE_FLAGS:
                     return &gjs_arg_member<int, GI_TYPE_TAG_INTERFACE>(
@@ -806,7 +889,7 @@ static void* get_return_ffi_pointer_from_giargument(
 
 // This function can be called in two different ways. You can either use it to
 // create JavaScript objects by calling it without @r_value, or you can decide
-// to keep the return values in #GArgument format by providing a @r_value
+// to keep the return values in GIArgument format by providing a @r_value
 // argument.
 bool Function::invoke(JSContext* context, const JS::CallArgs& args,
                       JS::HandleObject this_obj /* = nullptr */,
@@ -901,6 +984,9 @@ bool Function::invoke(JSContext* context, const JS::CallArgs& args,
     dynamicString += format_name();
     AutoProfilerLabel label(context, "", dynamicString.c_str());
 
+    g_assert(ffi_arg_pos + state.gi_argc <
+             std::numeric_limits<decltype(state.processed_c_args)>::max());
+
     state.processed_c_args = ffi_arg_pos;
     for (gi_arg_pos = 0; gi_arg_pos < state.gi_argc;
          gi_arg_pos++, ffi_arg_pos++) {
@@ -944,7 +1030,7 @@ bool Function::invoke(JSContext* context, const JS::CallArgs& args,
     }
 
     // This pointer needs to exist on the stack across the ffi_call() call
-    GError** errorp = state.local_error.out();
+    GError** errorp = &state.local_error;
 
     /* Did argument conversion fail?  In that case, skip invocation and jump to release
      * processing. */
@@ -963,9 +1049,10 @@ bool Function::invoke(JSContext* context, const JS::CallArgs& args,
     g_assert_cmpuint(ffi_arg_pos, ==, ffi_argc);
     g_assert_cmpuint(gi_arg_pos, ==, state.gi_argc);
 
+    GITypeTag return_tag = m_arguments.return_tag();
     GITypeInfo* return_type = m_arguments.return_type();
-    return_value_p =
-        get_return_ffi_pointer_from_giargument(return_type, &return_value);
+    return_value_p = get_return_ffi_pointer_from_gi_argument(
+        return_tag, return_type, &return_value);
     ffi_call(&m_invoker.cif, FFI_FN(m_invoker.native_address), return_value_p,
              ffi_arg_pointers.get());
 
@@ -978,6 +1065,11 @@ bool Function::invoke(JSContext* context, const JS::CallArgs& args,
     if (return_type) {
         gi_type_info_extract_ffi_return_value(return_type, &return_value,
                                               state.return_value());
+    } else if (return_tag != GI_TYPE_TAG_VOID) {
+        g_assert(GI_TYPE_TAG_IS_BASIC(return_tag));
+        gi_type_tag_extract_ffi_return_value(return_tag, GI_INFO_TYPE_INVALID,
+                                             &return_value,
+                                             state.return_value());
     }
 
     // Process out arguments and return values. This loop is skipped if we fail
@@ -1011,8 +1103,7 @@ bool Function::invoke(JSContext* context, const JS::CallArgs& args,
                     "to pass to the out '%s' argument. It may be that the "
                     "function is unsupported, or there may be a bug in "
                     "its annotations.",
-                    g_base_info_get_namespace(m_info),
-                    g_base_info_get_name(m_info),
+                    m_info.ns(), m_info.name(),
                     g_base_info_get_name(&arg_info));
                 state.failed = true;
                 break;
@@ -1143,9 +1234,7 @@ bool Function::call(JSContext* context, unsigned js_argc, JS::Value* vp) {
     gjs_debug_marshal(GJS_DEBUG_GFUNCTION, "Call callee %p priv %p",
                       callee.get(), priv);
 
-    if (priv == NULL)
-        return true;  // we are the prototype
-
+    g_assert(priv);
     return priv->invoke(context, js_argv);
 }
 
@@ -1155,8 +1244,7 @@ Function::~Function() {
 }
 
 void Function::finalize_impl(JS::GCContext*, Function* priv) {
-    if (priv == NULL)
-        return; /* we are the prototype, not a real instance, so constructor never called */
+    g_assert(priv);
     delete priv;
 }
 
@@ -1171,15 +1259,6 @@ bool Function::get_length(JSContext* cx, unsigned argc, JS::Value* vp) {
 
 bool Function::to_string(JSContext* context, unsigned argc, JS::Value* vp) {
     GJS_CHECK_WRAPPER_PRIV(context, argc, vp, rec, this_obj, Function, priv);
-
-    if (priv == NULL) {
-        JSString* retval = JS_NewStringCopyZ(context, "function () {\n}");
-        if (!retval)
-            return false;
-        rec.rval().setString(retval);
-        return true;
-    }
-
     return priv->to_string_impl(context, rec.rval());
 }
 
@@ -1202,7 +1281,7 @@ bool Function::to_string_impl(JSContext* cx, JS::MutableHandleValue rval) {
     }
 
     GjsAutoChar descr;
-    if (g_base_info_get_type(m_info) == GI_INFO_TYPE_FUNCTION) {
+    if (m_info.type() == GI_INFO_TYPE_FUNCTION) {
         descr = g_strdup_printf(
             "%s(%s) {\n\t/* wrapper for native symbol %s() */\n}",
             format_name().c_str(), arg_names.c_str(),
@@ -1242,20 +1321,19 @@ const JSFunctionSpec Function::proto_funcs[] = {
 
 bool Function::init(JSContext* context, GType gtype /* = G_TYPE_NONE */) {
     guint8 i;
-    GError *error = NULL;
+    GjsAutoError error;
 
     if (m_info.type() == GI_INFO_TYPE_FUNCTION) {
         if (!g_function_info_prep_invoker(m_info, &m_invoker, &error))
             return gjs_throw_gerror(context, error);
     } else if (m_info.type() == GI_INFO_TYPE_VFUNC) {
         void* addr = g_vfunc_info_get_address(m_info, gtype, &error);
-        if (error != NULL) {
+        if (error) {
             if (error->code != G_INVOKE_ERROR_SYMBOL_NOT_FOUND)
                 return gjs_throw_gerror(context, error);
 
             gjs_throw(context, "Virtual function not implemented: %s",
                       error->message);
-            g_clear_error(&error);
             return false;
         }
 
@@ -1346,8 +1424,7 @@ gjs_define_function(JSContext       *context,
                     GICallableInfo  *info)
 {
     GIInfoType info_type;
-    gchar *name;
-    bool free_name;
+    std::string name;
 
     info_type = g_base_info_get_type((GIBaseInfo *)info);
 
@@ -1357,23 +1434,18 @@ gjs_define_function(JSContext       *context,
         return NULL;
 
     if (info_type == GI_INFO_TYPE_FUNCTION) {
-        name = (gchar *) g_base_info_get_name((GIBaseInfo*) info);
-        free_name = false;
+        name = g_base_info_get_name(info);
     } else if (info_type == GI_INFO_TYPE_VFUNC) {
-        name = g_strdup_printf("vfunc_%s", g_base_info_get_name((GIBaseInfo*) info));
-        free_name = true;
+        name = "vfunc_" + std::string(g_base_info_get_name(info));
     } else {
         g_assert_not_reached ();
     }
 
-    if (!JS_DefineProperty(context, in_object, name, function,
+    if (!JS_DefineProperty(context, in_object, name.c_str(), function,
                            GJS_MODULE_PROP_FLAGS)) {
         gjs_debug(GJS_DEBUG_GFUNCTION, "Failed to define function");
         function = NULL;
     }
-
-    if (free_name)
-        g_free(name);
 
     return function;
 }

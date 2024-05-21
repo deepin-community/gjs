@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: 2019 Philip Chimento <philip.chimento@gmail.com>
 # SPDX-FileCopyrightText: 2019 Chun-wei Fan <fanchunwei@src.gnome.org>
 
-project('gjs', 'cpp', 'c', version: '1.74.2', license: ['MIT', 'LGPL2+'],
-    meson_version: '>= 0.54.0',
-    default_options: ['cpp_std=c++17', 'cpp_rtti=false', 'c_std=c99',
-        'warning_level=2', 'b_pch=true' ])
+project('gjs', 'cpp', 'c', version: '1.80.2', license: ['MIT', 'LGPL2+'],
+    meson_version: '>= 0.58.0',
+    default_options: ['cpp_std=c++17', 'cpp_rtti=false', 'cpp_eh=none',
+        'c_std=c99', 'warning_level=2', 'b_pch=true' ])
 
 # cpp_rtti: SpiderMonkey can be compiled with or without runtime type
 # information, and the default is without. We must match that option because we
@@ -14,7 +14,6 @@ project('gjs', 'cpp', 'c', version: '1.74.2', license: ['MIT', 'LGPL2+'],
 api_version = '1.0'
 api_name = '@0@-@1@'.format(meson.project_name(), api_version)
 
-fs = import('fs')
 gnome = import('gnome')
 pkg = import('pkgconfig')
 
@@ -40,7 +39,7 @@ if cc.get_id() == 'msvc'
     add_project_arguments(cxx.get_supported_arguments([
         '-utf-8',  # Use UTF-8 mode
         '/Zc:externConstexpr',  # Required for 'extern constexpr' on MSVC
-        '/Zc:preprocessor',     # Required to consume the mozjs-102 headers on MSVC
+        '/Zc:preprocessor',     # Required to consume the mozjs-115 headers on MSVC
 
         # Ignore spurious compiler warnings for things that GLib and SpiderMonkey
         # header files commonly do
@@ -61,6 +60,7 @@ else
         '-fno-strict-aliasing',
         '-Wno-variadic-macros',  # GLib uses these in header files
         '-Wno-missing-field-initializers',  # SpiderMonkey JSClass, among others
+        '-Wno-dangling-pointer',  # Root list in JS::Rooted<T> with GCC 12
     ]), language: 'cpp')
 
     add_project_arguments(cc.get_supported_arguments([
@@ -128,15 +128,22 @@ gio = dependency('gio-2.0', version: glib_required_version,
 ffi = dependency('libffi', fallback: ['libffi', 'ffi_dep'])
 gi = dependency('gobject-introspection-1.0', version: '>= 1.66.0',
     fallback: ['gobject-introspection', 'girepo_dep'])
-spidermonkey = dependency('mozjs-102')
+spidermonkey = dependency('mozjs-115')
 
 # We might need to look for the headers and lib's for Cairo
 # manually on MSVC/clang-cl builds...
-cairo = dependency('cairo', required: get_option('cairo').enabled() and cxx.get_argument_syntax() != 'msvc')
-cairo_gobject = dependency('cairo-gobject', required: cairo.found() and cxx.get_argument_syntax() != 'msvc')
-cairo_xlib = dependency('cairo-xlib', required: false)
+if get_option('cairo').disabled()
+    # dummy not-found dependency since we break the tristate feature in the else block
+    cairo = dependency('', required: false)
+    cairo_gobject = cairo
+    cairo_xlib = cairo
+else
+    cairo = dependency('cairo', required: get_option('cairo').enabled() and cxx.get_argument_syntax() != 'msvc')
+    cairo_gobject = dependency('cairo-gobject', required: cairo.found() and cxx.get_argument_syntax() != 'msvc')
+    cairo_xlib = dependency('cairo-xlib', required: false)
+endif
 
-if cxx.get_argument_syntax() == 'msvc'
+if cxx.get_argument_syntax() == 'msvc' and not get_option('cairo').disabled()
     if not cairo.found()
         cairo = cc.find_library('cairo', has_headers: ['cairo.h'], required: get_option('cairo').enabled())
     endif
@@ -201,7 +208,7 @@ else
     libatomic = cc.find_library('atomic', required: false)
 endif
 
-build_profiler = sysprof_capture.found() and not get_option('profiler').disabled()
+build_profiler = sysprof_capture.found()
 profiler_deps = [sysprof_capture]
 if build_profiler and not cxx.has_function('timer_settime')
     extra_timer_libs = ['rt', 'posix4']
@@ -225,8 +232,8 @@ it on other platforms.''')
     endif
 endif
 
-build_cairo = cairo.found() and not get_option('cairo').disabled()
-build_readline = readline.found() and not get_option('readline').disabled()
+build_cairo = cairo.found()
+build_readline = readline.found()
 
 ### Check for library features #################################################
 
@@ -442,7 +449,6 @@ libgjs_sources = [
     'gjs/promise.cpp', 'gjs/promise.h',
     'gjs/stack.cpp',
     'modules/console.cpp', 'modules/console.h',
-    'modules/modules.cpp', 'modules/modules.h',
     'modules/print.cpp', 'modules/print.h',
     'modules/system.cpp', 'modules/system.h',
 ]
@@ -529,7 +535,7 @@ if host_machine.system() == 'windows'
 endif
 
 # This dependency should provide everything that is needed to compile gjs except
-# the sources themselves, is used to copmile both the static libraries and the
+# the sources themselves, is used to compile both the static libraries and the
 # tests
 base_build_dep = declare_dependency(
     compile_args: libgjs_cpp_args,
@@ -587,7 +593,7 @@ libgjs_dep = declare_dependency(link_with: [libgjs, libgjs_jsapi],
 gjs_private_gir = gnome.generate_gir(libgjs,
     includes: ['GObject-2.0', 'Gio-2.0'], sources: libgjs_private_sources,
     namespace: 'GjsPrivate', nsversion: '1.0', identifier_prefix: 'Gjs',
-    symbol_prefix: 'gjs_', extra_args: '--warn-error', install: true,
+    symbol_prefix: 'gjs_', fatal_warnings: get_option('werror'), install: true,
     install_dir_gir: false, install_dir_typelib: pkglibdir / 'girepository-1.0')
 gjs_private_typelib = gjs_private_gir[1]
 
@@ -634,13 +640,15 @@ js_tests_builddir = meson.current_build_dir() / 'installed-tests' / 'js'
 libgjs_test_tools_builddir = js_tests_builddir / 'libgjstesttools'
 # GJS_PATH is empty here since we want to force the use of our own
 # resources. G_FILENAME_ENCODING ensures filenames are not UTF-8
-tests_environment.set('TOP_BUILDDIR', meson.build_root())
+tests_environment.set('TOP_BUILDDIR', meson.project_build_root())
 tests_environment.set('GJS_USE_UNINSTALLED_FILES', '1')
 tests_environment.set('GJS_PATH', '')
 tests_environment.set('GJS_DEBUG_OUTPUT', 'stderr')
 tests_environment.prepend('GI_TYPELIB_PATH', meson.current_build_dir(),
     js_tests_builddir, libgjs_test_tools_builddir)
 tests_environment.prepend('LD_LIBRARY_PATH', meson.current_build_dir(),
+    js_tests_builddir, libgjs_test_tools_builddir)
+tests_environment.prepend('DYLD_FALLBACK_LIBRARY_PATH', meson.current_build_dir(),
     js_tests_builddir, libgjs_test_tools_builddir)
 tests_environment.set('G_FILENAME_ENCODING', 'latin1')
 # Workaround for https://github.com/google/sanitizers/issues/1322
@@ -651,6 +659,7 @@ tests_environment.set('LSAN_OPTIONS',
 tests_environment.set('TSAN_OPTIONS',
     'history_size=5,force_seq_cst_atomics=1,suppressions=@0@'.format(
         meson.current_source_dir() / 'installed-tests' / 'extra' / 'tsan.supp'))
+tests_environment.set('G_SLICE', 'always-malloc')
 tests_environment.set('NO_AT_BRIDGE', '1')
 tests_environment.set('GSETTINGS_SCHEMA_DIR', js_tests_builddir)
 tests_environment.set('GSETTINGS_BACKEND', 'memory')
@@ -658,7 +667,7 @@ tests_environment.set('G_DEBUG', 'fatal-warnings,fatal-criticals')
 
 tests_locale = 'N/A'
 if cxx.get_argument_syntax() != 'msvc'
-    result = run_command('build/choose-tests-locale.sh')
+    result = run_command('build/choose-tests-locale.sh', check: false)
     if result.returncode() == 0
         tests_locale = result.stdout().strip()
         tests_environment.set('LC_ALL', tests_locale)
@@ -676,10 +685,6 @@ if get_option('b_coverage')
 endif
 
 ### Tests and test setups ######################################################
-
-if not get_option('skip_gtk_tests')
-    have_gtk4 = dependency('gtk4', required: false).found()
-endif
 
 subdir('installed-tests')
 
@@ -730,7 +735,7 @@ add_test_setup('post_verify', timeout_multiplier: 2, env: zeal11_environment)
 
 ### Warn about conditions that may affect runtime ##############################
 
-if gi.version().version_compare('<1.66.1')
+if gi.version().version_compare('<1.71.0')
     warning('''You do not have a new enough version of
 gobject-introspection to run the tests. You can still build GJS, but some
 tests will fail.''')
@@ -768,14 +773,14 @@ libdir = get_option('libdir')
 datadir = get_option('datadir')
 summary({
     'prefix': prefix,
-    'bindir': fs.is_absolute(bindir) ? bindir : prefix / bindir,
-    'libdir': fs.is_absolute(libdir) ? libdir : prefix / libdir,
-    'datadir': fs.is_absolute(datadir) ? datadir : prefix / datadir,
+    'bindir': prefix / bindir,
+    'libdir': prefix / libdir,
+    'datadir': prefix / datadir,
 }, section: 'Directories')
 locations = []
 foreach dep: [ffi, glib, gi, spidermonkey, readline, sysprof_capture]
     if dep.type_name() == 'pkgconfig'
-        locations += 'in @0@'.format(dep.get_pkgconfig_variable('prefix'))
+        locations += 'in @0@'.format(dep.get_variable(pkgconfig: 'prefix'))
     else
         locations += dep.type_name()
     endif
@@ -803,11 +808,22 @@ summary({
     'Skip GTK tests': get_option('skip_gtk_tests'),
     'Extra debug logs': get_option('verbose_logs'),
     'Precompiled headers': get_option('b_pch'),
-}, section: 'Build options')
+}, section: 'Build options', bool_yn: true)
 summary({
     'Cairo module': build_cairo,
     'Use readline for input': build_readline,
     'Profiler (Linux only)': build_profiler,
     'Dtrace debugging': get_option('dtrace'),
     'Systemtap debugging': get_option('systemtap'),
-}, section: 'Optional features')
+}, section: 'Optional features', bool_yn: true)
+
+### Development environment ####################################################
+
+meson.add_devenv({'GJS_USE_UNINSTALLED_FILES': '1'})
+
+### Maintainer scripts #########################################################
+
+run_target('maintainer-upload-release',
+  command: ['build/maintainer-upload-release.sh',
+            meson.project_name(),
+            meson.project_version()])

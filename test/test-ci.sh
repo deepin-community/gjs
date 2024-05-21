@@ -10,13 +10,25 @@ do_Set_Env () {
 
     #SpiderMonkey and libgjs
     export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
-    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib64:/usr/local/lib
+    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib64:/usr/local/lib:
+    export GI_TYPELIB_PATH=$GI_TYPELIB_PATH:/usr/lib64/girepository-1.0
 
     #Macros
     export ACLOCAL_PATH=$ACLOCAL_PATH:/usr/local/share/aclocal
 
     export SHELL=/bin/bash
     PATH=$PATH:~/.local/bin
+
+    if [ "$USE_UNSTABLE_GNOME_PREFIX" = "true" ]; then
+        prefix=/opt/GNOME
+        libdir=$prefix/lib64
+        export PATH=$prefix/bin:$PATH
+        export LD_LIBRARY_PATH=$libdir:$LD_LIBRARY_PATH
+        export PKG_CONFIG_PATH=$libdir/pkgconfig:$PKG_CONFIG_PATH
+        export GI_TYPELIB_PATH=$libdir/girepository-1.0:$GI_TYPELIB_PATH
+        export XDG_DATA_DIRS=$prefix/share:$XDG_DATA_DIRS
+        export ACLOCAL_PATH=$prefix/share/aclocal:$ACLOCAL_PATH
+    fi
 
     export DISPLAY="${DISPLAY:-:0}"
 }
@@ -48,11 +60,11 @@ do_Get_Upstream_Base () {
         git fetch --depth=30 --no-tags upstream "$base_branch"
     fi
 
-    git branch ci-upstream-base-branch FETCH_HEAD
+    git branch -f ci-upstream-base-branch FETCH_HEAD
 
     # Work out the newest common ancestor between the detached HEAD that this CI
     # job has checked out, and the upstream target branch (which will typically
-    # be `upstream/master` or `upstream/gnome-nn`).
+    # be `upstream/main` or `upstream/gnome-nn`).
     newest_common_ancestor_sha=$(git merge-base ci-upstream-base-branch HEAD)
     if test -z "$newest_common_ancestor_sha"; then
         echo "Couldn’t find common ancestor with the upstream main branch. This"
@@ -138,8 +150,8 @@ elif test "$1" = "BUILD"; then
     do_Set_Env
 
     DEFAULT_CONFIG_OPTS="-Dcairo=enabled -Dreadline=enabled -Dprofiler=enabled \
-        -Ddtrace=false -Dsystemtap=false -Dverbose_logs=false"
-    meson _build $DEFAULT_CONFIG_OPTS $CONFIG_OPTS
+        -Ddtrace=false -Dsystemtap=false -Dverbose_logs=false --werror"
+    meson setup _build $DEFAULT_CONFIG_OPTS $CONFIG_OPTS
     ninja -C _build
 
     if test "$TEST" != "skip"; then

@@ -27,7 +27,6 @@
 #include <js/Value.h>
 #include <js/experimental/TypedData.h>
 #include <jsapi.h>        // for InformalValueTypeName, JS_TypeOfValue
-#include <jsfriendapi.h>  // for JS_GetObjectFunction
 #include <jspubtd.h>      // for JSTYPE_FUNCTION
 
 #include "gi/arg-cache.h"
@@ -64,9 +63,9 @@ static const char* expected_type_names[] = {"object", "function", "string"};
 static_assert(G_N_ELEMENTS(expected_type_names) == ExpectedType::LAST,
               "Names must match the values in ExpectedType");
 
-static constexpr void gjs_g_argument_set_array_length(GITypeTag tag,
-                                                      GIArgument* arg,
-                                                      size_t value) {
+static constexpr void gjs_gi_argument_set_array_length(GITypeTag tag,
+                                                       GIArgument* arg,
+                                                       size_t value) {
     switch (tag) {
         case GI_TYPE_TAG_INT8:
             gjs_arg_set<int8_t>(arg, value);
@@ -122,6 +121,14 @@ static bool report_invalid_null(JSContext* cx, const char* arg_name) {
     return false;
 }
 
+// Overload operator| so that Visual Studio won't complain
+// when converting unsigned char to GjsArgumentFlags
+GjsArgumentFlags operator|(
+    GjsArgumentFlags const& v1, GjsArgumentFlags const& v2) {
+    return static_cast<GjsArgumentFlags>(std::underlying_type<GjsArgumentFlags>::type(v1) |
+                                         std::underlying_type<GjsArgumentFlags>::type(v2));
+}
+
 namespace Gjs {
 namespace Arg {
 
@@ -138,18 +145,13 @@ struct BasicType {
     GITypeTag m_tag : 5;
 };
 
-struct String {
-    constexpr String() : m_filename(false) {}
-    bool m_filename : 1;
-};
-
 struct TypeInfo {
     constexpr GITypeInfo* type_info() const {
         // Should be const GITypeInfo*, but G-I APIs won't accept that
         return const_cast<GITypeInfo*>(&m_type_info);
     }
 
-    GITypeInfo m_type_info;
+    GITypeInfo m_type_info{};
 };
 
 struct Transferable {
@@ -171,14 +173,6 @@ struct Nullable {
     }
 };
 
-// Overload operator| so that Visual Studio won't complain
-// when converting unsigned char to GjsArgumentFlags
-GjsArgumentFlags operator|(
-    GjsArgumentFlags const& v1, GjsArgumentFlags const& v2) {
-    return static_cast<GjsArgumentFlags>(std::underlying_type<GjsArgumentFlags>::type(v1) |
-                                         std::underlying_type<GjsArgumentFlags>::type(v2));
-}
-
 struct Positioned {
     void set_arg_pos(int pos) {
         g_assert(pos <= Argument::MAX_ARGS &&
@@ -193,59 +187,72 @@ struct Positioned {
         return true;
     }
 
+    constexpr bool set_inout_parameter(GjsFunctionCallState* state,
+                                       GIArgument* arg) {
+        state->out_cvalue(m_arg_pos) = state->inout_original_cvalue(m_arg_pos) =
+            *arg;
+        gjs_arg_set(arg, &state->out_cvalue(m_arg_pos));
+        return true;
+    }
+
     uint8_t m_arg_pos = 0;
 };
 
 struct Array : BasicType {
     uint8_t m_length_pos = 0;
+    GIDirection m_length_direction : 2;
 
-    void set_array_length(int pos, GITypeTag tag) {
+    Array() : BasicType(), m_length_direction(GI_DIRECTION_IN) {}
+
+    void set_array_length(int pos, GITypeTag tag, GIDirection direction) {
         g_assert(pos >= 0 && pos <= Argument::MAX_ARGS &&
                  "No more than 253 arguments allowed");
         m_length_pos = pos;
+        m_length_direction = direction;
         m_tag = tag;
     }
 };
 
-struct BaseInfo {
-    constexpr explicit BaseInfo(GIBaseInfo* info,
-                                const GjsAutoTakeOwnership& add_ref)
+struct HasIntrospectionInfo {
+    constexpr explicit HasIntrospectionInfo(GIBaseInfo* info,
+                                            const GjsAutoTakeOwnership& add_ref)
         : m_info(info, add_ref) {}
-    constexpr explicit BaseInfo(GIBaseInfo* info) : m_info(info) {}
+    constexpr explicit HasIntrospectionInfo(GIBaseInfo* info) : m_info(info) {}
 
     GjsAutoBaseInfo m_info;
 };
 
 // boxed / union / GObject
-struct RegisteredType {
+struct GTypedType {
+    explicit GTypedType(GType gtype) : m_gtype(gtype) {}
+    constexpr GType gtype() const { return m_gtype; }
+
+ protected:
+    GType m_gtype;
+};
+
+struct RegisteredType : GTypedType {
     RegisteredType(GType gtype, GIInfoType info_type)
-        : m_gtype(gtype), m_info_type(info_type) {}
-    explicit RegisteredType(GIBaseInfo* info)
-        : m_gtype(g_registered_type_info_get_g_type(info)),
+        : GTypedType(gtype), m_info_type(info_type) {}
+    explicit RegisteredType(GIRegisteredTypeInfo* info)
+        : GTypedType(g_registered_type_info_get_g_type(info)),
           m_info_type(g_base_info_get_type(info)) {
         g_assert(m_gtype != G_TYPE_NONE &&
                  "Use RegisteredInterface for this type");
     }
 
-    constexpr GType gtype() const { return m_gtype; }
-
-    GType m_gtype;
     GIInfoType m_info_type : 5;
 };
 
-struct RegisteredInterface : BaseInfo {
-    explicit RegisteredInterface(GIBaseInfo* info)
-        : BaseInfo(info, GjsAutoTakeOwnership{}),
-          m_gtype(g_registered_type_info_get_g_type(m_info)) {}
-
-    constexpr GType gtype() const { return m_gtype; }
-
-    GType m_gtype;
+struct RegisteredInterface : HasIntrospectionInfo, GTypedType {
+    explicit RegisteredInterface(GIRegisteredTypeInfo* info)
+        : HasIntrospectionInfo(info, GjsAutoTakeOwnership{}),
+          GTypedType(g_registered_type_info_get_g_type(m_info)) {}
 };
 
-struct Callback : Nullable, BaseInfo {
-    explicit Callback(GIInterfaceInfo* info)
-        : BaseInfo(info, GjsAutoTakeOwnership{}),
+struct Callback : Nullable, HasIntrospectionInfo {
+    explicit Callback(GICallbackInfo* info)
+        : HasIntrospectionInfo(info, GjsAutoTakeOwnership{}),
           m_scope(GI_SCOPE_TYPE_INVALID) {}
 
     inline void set_callback_destroy_pos(int pos) {
@@ -347,7 +354,10 @@ struct GenericOut : GenericInOut {
     bool release(JSContext*, GjsFunctionCallState*, GIArgument*,
                  GIArgument*) override;
 
-    const ReturnValue* as_return_value() const override { return this; }
+    GITypeTag return_tag() const override {
+        return g_type_info_get_tag(&const_cast<GenericOut*>(this)->m_type_info);
+    }
+    const GITypeInfo* return_type() const override { return &m_type_info; }
 };
 
 struct GenericReturn : ReturnValue {
@@ -357,6 +367,39 @@ struct GenericReturn : ReturnValue {
         return invalid(cx, G_STRFUNC);
     }
 };
+
+template <typename T, GITypeTag TAG = GI_TYPE_TAG_VOID>
+struct NumericOut : SkipAll, Positioned {
+    static_assert(std::is_arithmetic_v<T>, "Not arithmetic type");
+    bool in(JSContext*, GjsFunctionCallState* state, GIArgument* arg,
+            JS::HandleValue) override {
+        return set_out_parameter(state, arg);
+    }
+    bool out(JSContext* cx, GjsFunctionCallState*, GIArgument* arg,
+             JS::MutableHandleValue value) override {
+        return Gjs::c_value_to_js_checked<T, TAG>(cx, gjs_arg_get<T>(arg),
+                                                  value);
+    }
+};
+
+using BooleanOut = NumericOut<gboolean, GI_TYPE_TAG_BOOLEAN>;
+
+template <typename T, GITypeTag TAG = GI_TYPE_TAG_VOID>
+struct NumericReturn : SkipAll {
+    static_assert(std::is_arithmetic_v<T>, "Not arithmetic type");
+    bool in(JSContext* cx, GjsFunctionCallState*, GIArgument*,
+            JS::HandleValue) override {
+        return invalid(cx, G_STRFUNC);
+    }
+    bool out(JSContext* cx, GjsFunctionCallState*, GIArgument* arg,
+             JS::MutableHandleValue value) override {
+        return Gjs::c_value_to_js_checked<T, TAG>(cx, gjs_arg_get<T>(arg),
+                                                  value);
+    }
+    GITypeTag return_tag() const override { return TAG; }
+};
+
+using BooleanReturn = NumericReturn<gboolean, GI_TYPE_TAG_BOOLEAN>;
 
 struct SimpleOut : SkipAll, Positioned {
     bool in(JSContext*, GjsFunctionCallState* state, GIArgument* arg,
@@ -403,6 +446,13 @@ struct ExplicitArrayOut : ExplicitArrayInOut {
 struct ReturnArray : ExplicitArrayOut {
     bool in(JSContext* cx, GjsFunctionCallState* state, GIArgument* arg,
             JS::HandleValue value) override {
+        if (m_length_direction != GI_DIRECTION_OUT) {
+            gjs_throw(cx,
+                      "Using different length argument direction for array %s"
+                      "is not supported for out arrays",
+                      m_arg_name);
+            return false;
+        }
         return GenericOut::in(cx, state, arg, value);
     };
 };
@@ -511,9 +561,9 @@ struct FallbackInterfaceIn : RegisteredInterfaceIn, TypeInfo {
 
     bool in(JSContext* cx, GjsFunctionCallState*, GIArgument* arg,
             JS::HandleValue value) override {
-        return gjs_value_to_g_argument(cx, value, &m_type_info, m_arg_name,
-                                       GJS_ARGUMENT_ARGUMENT, m_transfer,
-                                       flags(), arg);
+        return gjs_value_to_gi_argument(cx, value, &m_type_info, m_arg_name,
+                                        GJS_ARGUMENT_ARGUMENT, m_transfer,
+                                        flags(), arg);
     }
 };
 
@@ -536,11 +586,11 @@ struct BoxedIn : BoxedInTransferNone {
     }
 };
 
-struct UnregisteredBoxedIn : BoxedIn, BaseInfo {
-    explicit UnregisteredBoxedIn(GIInterfaceInfo* info)
+struct UnregisteredBoxedIn : BoxedIn, HasIntrospectionInfo {
+    explicit UnregisteredBoxedIn(GIStructInfo* info)
         : BoxedIn(g_registered_type_info_get_g_type(info),
                   g_base_info_get_type(info)),
-          BaseInfo(info, GjsAutoTakeOwnership{}) {}
+          HasIntrospectionInfo(info, GjsAutoTakeOwnership{}) {}
     // This is a smart argument, no release needed
     GIBaseInfo* info() const override { return m_info; }
 };
@@ -575,6 +625,8 @@ struct GBytesIn : BoxedIn {
     using BoxedIn::BoxedIn;
     bool in(JSContext*, GjsFunctionCallState*, GIArgument*,
             JS::HandleValue) override;
+    bool release(JSContext* cx, GjsFunctionCallState* state, GIArgument* in_arg,
+                 GIArgument* out_arg) override;
 };
 
 struct GBytesInTransferNone : GBytesIn {
@@ -623,11 +675,31 @@ struct BooleanIn : SkipAll {
             JS::HandleValue) override;
 };
 
-struct NumericIn : SkipAll, BasicType {
-    explicit NumericIn(GITypeTag tag) : BasicType(tag) {}
+template <typename T>
+struct NumericIn : SkipAll {
+    static_assert(std::is_arithmetic_v<T>, "Not arithmetic type");
     bool in(JSContext*, GjsFunctionCallState*, GIArgument*,
             JS::HandleValue) override;
 };
+
+template <typename T, GITypeTag TAG = GI_TYPE_TAG_VOID>
+struct NumericInOut : NumericIn<T>, Positioned {
+    static_assert(std::is_arithmetic_v<T>, "Not arithmetic type");
+    bool in(JSContext* cx, GjsFunctionCallState* state, GIArgument* arg,
+            JS::HandleValue value) override {
+        if (!NumericIn<T>::in(cx, state, arg, value))
+            return false;
+
+        return set_inout_parameter(state, arg);
+    }
+    bool out(JSContext* cx, GjsFunctionCallState*, GIArgument* arg,
+             JS::MutableHandleValue value) override {
+        return Gjs::c_value_to_js_checked<T, TAG>(cx, gjs_arg_get<T>(arg),
+                                                  value);
+    }
+};
+
+using BooleanInOut = NumericInOut<gboolean, GI_TYPE_TAG_BOOLEAN>;
 
 struct UnicharIn : SkipAll {
     bool in(JSContext*, GjsFunctionCallState*, GIArgument*,
@@ -639,26 +711,61 @@ struct GTypeIn : SkipAll {
             JS::HandleValue) override;
 };
 
-struct StringInTransferNone : NullableIn, String {
+template <GITypeTag TAG = GI_TYPE_TAG_UTF8>
+struct StringInTransferNone : NullableIn {
     bool in(JSContext*, GjsFunctionCallState*, GIArgument*,
             JS::HandleValue) override;
     bool release(JSContext*, GjsFunctionCallState*, GIArgument*,
                  GIArgument*) override;
 };
 
-struct StringIn : StringInTransferNone {
+struct StringIn : StringInTransferNone<GI_TYPE_TAG_UTF8> {
     bool release(JSContext*, GjsFunctionCallState*, GIArgument*,
                  GIArgument*) override {
         return skip();
     }
 };
 
-struct FilenameInTransferNone : StringInTransferNone {
-    FilenameInTransferNone() { m_filename = true; }
+template <GITransfer TRANSFER = GI_TRANSFER_NOTHING>
+struct StringOutBase : SkipAll {
+    bool out(JSContext* cx, GjsFunctionCallState*, GIArgument* arg,
+             JS::MutableHandleValue value) override {
+        return Gjs::c_value_to_js(cx, gjs_arg_get<char*>(arg), value);
+    }
+    bool release(JSContext* cx, GjsFunctionCallState*, GIArgument*,
+                 GIArgument* out_arg [[maybe_unused]]) override {
+        if constexpr (TRANSFER == GI_TRANSFER_NOTHING) {
+            return skip();
+        } else if constexpr (TRANSFER == GI_TRANSFER_EVERYTHING) {
+            g_clear_pointer(&gjs_arg_member<char*>(out_arg), g_free);
+            return true;
+        } else {
+            return invalid(cx, G_STRFUNC);
+        }
+    }
 };
 
+template <GITransfer TRANSFER = GI_TRANSFER_NOTHING>
+struct StringReturn : StringOutBase<TRANSFER> {
+    bool in(JSContext* cx, GjsFunctionCallState*, GIArgument*,
+            JS::HandleValue) override {
+        return Argument::invalid(cx, G_STRFUNC);
+    }
+
+    GITypeTag return_tag() const override { return GI_TYPE_TAG_UTF8; }
+};
+
+template <GITransfer TRANSFER = GI_TRANSFER_NOTHING>
+struct StringOut : StringOutBase<TRANSFER>, Positioned {
+    bool in(JSContext*, GjsFunctionCallState* state, GIArgument* arg,
+            JS::HandleValue) override {
+        return set_out_parameter(state, arg);
+    }
+};
+
+using FilenameInTransferNone = StringInTransferNone<GI_TYPE_TAG_FILENAME>;
+
 struct FilenameIn : FilenameInTransferNone {
-    FilenameIn() { m_filename = true; }
     bool release(JSContext*, GjsFunctionCallState*, GIArgument*,
                  GIArgument*) override {
         return skip();
@@ -714,6 +821,84 @@ struct CallerAllocatesOut : GenericOut, CallerAllocates {
     }
 };
 
+struct BoxedCallerAllocatesOut : CallerAllocatesOut, GTypedType {
+    using GTypedType::GTypedType;
+    bool release(JSContext*, GjsFunctionCallState*, GIArgument*,
+                 GIArgument*) override;
+};
+
+struct ZeroTerminatedArrayInOut : GenericInOut {
+    bool release(JSContext* cx, GjsFunctionCallState* state, GIArgument*,
+                 GIArgument* out_arg) override {
+        GITransfer transfer =
+            state->call_completed() ? m_transfer : GI_TRANSFER_NOTHING;
+        GIArgument* original_out_arg = &state->inout_original_cvalue(m_arg_pos);
+        if (!gjs_gi_argument_release_in_array(cx, transfer, &m_type_info,
+                                              original_out_arg))
+            return false;
+
+        transfer =
+            state->call_completed() ? m_transfer : GI_TRANSFER_EVERYTHING;
+        return gjs_gi_argument_release_out_array(cx, transfer, &m_type_info,
+                                                 out_arg);
+    }
+};
+
+struct ZeroTerminatedArrayIn : GenericIn, Nullable {
+    bool out(JSContext*, GjsFunctionCallState*, GIArgument*,
+             JS::MutableHandleValue) override {
+        return skip();
+    }
+
+    bool release(JSContext* cx, GjsFunctionCallState* state, GIArgument* in_arg,
+                 GIArgument*) override {
+        GITransfer transfer =
+            state->call_completed() ? m_transfer : GI_TRANSFER_NOTHING;
+
+        return gjs_gi_argument_release_in_array(cx, transfer, &m_type_info,
+                                                in_arg);
+    }
+
+    GjsArgumentFlags flags() const override {
+        return Argument::flags() | Nullable::flags();
+    }
+};
+
+struct FixedSizeArrayIn : GenericIn {
+    bool out(JSContext*, GjsFunctionCallState*, GIArgument*,
+             JS::MutableHandleValue) override {
+        return skip();
+    }
+
+    bool release(JSContext* cx, GjsFunctionCallState* state, GIArgument* in_arg,
+                 GIArgument*) override {
+        GITransfer transfer =
+            state->call_completed() ? m_transfer : GI_TRANSFER_NOTHING;
+
+        int size = g_type_info_get_array_fixed_size(&m_type_info);
+        return gjs_gi_argument_release_in_array(cx, transfer, &m_type_info,
+                                                size, in_arg);
+    }
+};
+
+struct FixedSizeArrayInOut : GenericInOut {
+    bool release(JSContext* cx, GjsFunctionCallState* state, GIArgument*,
+                 GIArgument* out_arg) override {
+        GITransfer transfer =
+            state->call_completed() ? m_transfer : GI_TRANSFER_NOTHING;
+        GIArgument* original_out_arg = &state->inout_original_cvalue(m_arg_pos);
+        int size = g_type_info_get_array_fixed_size(&m_type_info);
+        if (!gjs_gi_argument_release_in_array(cx, transfer, &m_type_info, size,
+                                              original_out_arg))
+            return false;
+
+        transfer =
+            state->call_completed() ? m_transfer : GI_TRANSFER_EVERYTHING;
+        return gjs_gi_argument_release_out_array(cx, transfer, &m_type_info,
+                                                 size, out_arg);
+    }
+};
+
 GJS_JSAPI_RETURN_CONVENTION
 bool NotIntrospectable::in(JSContext* cx, GjsFunctionCallState* state,
                            GIArgument*, JS::HandleValue) {
@@ -761,9 +946,9 @@ bool NotIntrospectable::in(JSContext* cx, GjsFunctionCallState* state,
 GJS_JSAPI_RETURN_CONVENTION
 bool GenericIn::in(JSContext* cx, GjsFunctionCallState*, GIArgument* arg,
                    JS::HandleValue value) {
-    return gjs_value_to_g_argument(cx, value, &m_type_info, m_arg_name,
-                                   GJS_ARGUMENT_ARGUMENT, m_transfer, flags(),
-                                   arg);
+    return gjs_value_to_gi_argument(cx, value, &m_type_info, m_arg_name,
+                                    GJS_ARGUMENT_ARGUMENT, m_transfer, flags(),
+                                    arg);
 }
 
 GJS_JSAPI_RETURN_CONVENTION
@@ -772,25 +957,29 @@ bool GenericInOut::in(JSContext* cx, GjsFunctionCallState* state,
     if (!GenericIn::in(cx, state, arg, value))
         return false;
 
-    state->out_cvalue(m_arg_pos) = state->inout_original_cvalue(m_arg_pos) =
-        *arg;
-    gjs_arg_set(arg, &state->out_cvalue(m_arg_pos));
-    return true;
+    return set_inout_parameter(state, arg);
 }
 
 GJS_JSAPI_RETURN_CONVENTION
 bool ExplicitArrayIn::in(JSContext* cx, GjsFunctionCallState* state,
-                         GArgument* arg, JS::HandleValue value) {
+                         GIArgument* arg, JS::HandleValue value) {
     void* data;
     size_t length;
+
+    if (m_length_direction != GI_DIRECTION_INOUT &&
+        m_length_direction != GI_DIRECTION_IN) {
+        gjs_throw(cx, "Using different length argument direction for array %s"
+                  "is not supported for in arrays", m_arg_name);
+        return false;
+    }
 
     if (!gjs_array_to_explicit_array(cx, value, &m_type_info, m_arg_name,
                                      GJS_ARGUMENT_ARGUMENT, m_transfer, flags(),
                                      &data, &length))
         return false;
 
-    gjs_g_argument_set_array_length(m_tag, &state->in_cvalue(m_length_pos),
-                                    length);
+    gjs_gi_argument_set_array_length(m_tag, &state->in_cvalue(m_length_pos),
+                                     length);
     gjs_arg_set(arg, data);
     return true;
 }
@@ -814,11 +1003,13 @@ bool ExplicitArrayInOut::in(JSContext* cx, GjsFunctionCallState* state,
         gjs_arg_unset<void*>(&state->out_cvalue(ix));
         gjs_arg_unset<void*>(&state->inout_original_cvalue(ix));
     } else {
-        state->out_cvalue(length_pos) =
-            state->inout_original_cvalue(length_pos) =
-                state->in_cvalue(length_pos);
-        gjs_arg_set(&state->in_cvalue(length_pos),
-                    &state->out_cvalue(length_pos));
+        if G_LIKELY (m_length_direction == GI_DIRECTION_INOUT) {
+            state->out_cvalue(length_pos) =
+                state->inout_original_cvalue(length_pos) =
+                    state->in_cvalue(length_pos);
+            gjs_arg_set(&state->in_cvalue(length_pos),
+                        &state->out_cvalue(length_pos));
+        }
 
         state->out_cvalue(ix) = state->inout_original_cvalue(ix) = *arg;
         gjs_arg_set(arg, &state->out_cvalue(ix));
@@ -844,10 +1035,10 @@ bool CallbackIn::in(JSContext* cx, GjsFunctionCallState* state, GIArgument* arg,
             return false;
         }
 
-        JS::RootedFunction func(cx, JS_GetObjectFunction(&value.toObject()));
+        JS::RootedObject callable(cx, &value.toObject());
         bool is_object_method = !!state->instance_object;
-        trampoline = GjsCallbackTrampoline::create(cx, func, m_info, m_scope,
-                                                   is_object_method, false);
+        trampoline = GjsCallbackTrampoline::create(
+            cx, callable, m_info, m_scope, is_object_method, false);
         if (!trampoline)
             return false;
         if (m_scope == GI_SCOPE_TYPE_NOTIFIED && is_object_method) {
@@ -930,58 +1121,29 @@ bool BooleanIn::in(JSContext*, GjsFunctionCallState*, GIArgument* arg,
 }
 
 template <typename T>
-GJS_JSAPI_RETURN_CONVENTION inline static bool gjs_arg_set_from_js_value(
-    JSContext* cx, const JS::HandleValue& value, GArgument* arg,
-    Argument* gjs_arg) {
+GJS_JSAPI_RETURN_CONVENTION bool NumericIn<T>::in(JSContext* cx,
+                                                  GjsFunctionCallState*,
+                                                  GIArgument* arg,
+                                                  JS::HandleValue value) {
     bool out_of_range = false;
 
     if (!gjs_arg_set_from_js_value<T>(cx, value, arg, &out_of_range)) {
         if (out_of_range) {
             gjs_throw(cx, "Argument %s: value is out of range for %s",
-                      gjs_arg->arg_name(), Gjs::static_type_name<T>());
+                      arg_name(), Gjs::static_type_name<T>());
         }
 
         return false;
     }
 
-    gjs_debug_marshal(
-        GJS_DEBUG_GFUNCTION, "%s set to value %s (type %s)",
-        GjsAutoChar(gjs_argument_display_name(gjs_arg->arg_name(),
-                                              GJS_ARGUMENT_ARGUMENT))
-            .get(),
-        std::to_string(gjs_arg_get<T>(arg)).c_str(),
-        Gjs::static_type_name<T>());
+    gjs_debug_marshal(GJS_DEBUG_GFUNCTION, "%s set to value %s (type %s)",
+                      GjsAutoChar{gjs_argument_display_name(
+                                      arg_name(), GJS_ARGUMENT_ARGUMENT)}
+                          .get(),
+                      std::to_string(gjs_arg_get<T>(arg)).c_str(),
+                      Gjs::static_type_name<T>());
 
     return true;
-}
-
-GJS_JSAPI_RETURN_CONVENTION
-bool NumericIn::in(JSContext* cx, GjsFunctionCallState*, GIArgument* arg,
-                   JS::HandleValue value) {
-    switch (m_tag) {
-        case GI_TYPE_TAG_INT8:
-            return gjs_arg_set_from_js_value<int8_t>(cx, value, arg, this);
-        case GI_TYPE_TAG_UINT8:
-            return gjs_arg_set_from_js_value<uint8_t>(cx, value, arg, this);
-        case GI_TYPE_TAG_INT16:
-            return gjs_arg_set_from_js_value<int16_t>(cx, value, arg, this);
-        case GI_TYPE_TAG_UINT16:
-            return gjs_arg_set_from_js_value<uint16_t>(cx, value, arg, this);
-        case GI_TYPE_TAG_INT32:
-            return gjs_arg_set_from_js_value<int32_t>(cx, value, arg, this);
-        case GI_TYPE_TAG_DOUBLE:
-            return gjs_arg_set_from_js_value<double>(cx, value, arg, this);
-        case GI_TYPE_TAG_FLOAT:
-            return gjs_arg_set_from_js_value<float>(cx, value, arg, this);
-        case GI_TYPE_TAG_INT64:
-            return gjs_arg_set_from_js_value<int64_t>(cx, value, arg, this);
-        case GI_TYPE_TAG_UINT64:
-            return gjs_arg_set_from_js_value<uint64_t>(cx, value, arg, this);
-        case GI_TYPE_TAG_UINT32:
-            return gjs_arg_set_from_js_value<uint32_t>(cx, value, arg, this);
-        default:
-            g_assert_not_reached();
-    }
 }
 
 GJS_JSAPI_RETURN_CONVENTION
@@ -1017,9 +1179,10 @@ bool Nullable::handle_nullable(JSContext* cx, GIArgument* arg,
     return true;
 }
 
-GJS_JSAPI_RETURN_CONVENTION
-bool StringInTransferNone::in(JSContext* cx, GjsFunctionCallState* state,
-                              GIArgument* arg, JS::HandleValue value) {
+template <GITypeTag TAG>
+GJS_JSAPI_RETURN_CONVENTION bool StringInTransferNone<TAG>::in(
+    JSContext* cx, GjsFunctionCallState* state, GIArgument* arg,
+    JS::HandleValue value) {
     if (value.isNull())
         return NullableIn::in(cx, state, arg, value);
 
@@ -1027,19 +1190,21 @@ bool StringInTransferNone::in(JSContext* cx, GjsFunctionCallState* state,
         return report_typeof_mismatch(cx, m_arg_name, value,
                                       ExpectedType::STRING);
 
-    if (m_filename) {
+    if constexpr (TAG == GI_TYPE_TAG_FILENAME) {
         GjsAutoChar str;
         if (!gjs_string_to_filename(cx, value, &str))
             return false;
         gjs_arg_set(arg, str.release());
         return true;
+    } else if constexpr (TAG == GI_TYPE_TAG_UTF8) {
+        JS::UniqueChars str = gjs_string_to_utf8(cx, value);
+        if (!str)
+            return false;
+        gjs_arg_set(arg, g_strdup(str.get()));
+        return true;
+    } else {
+        return invalid(cx, G_STRFUNC);
     }
-
-    JS::UniqueChars str = gjs_string_to_utf8(cx, value);
-    if (!str)
-        return false;
-    gjs_arg_set(arg, g_strdup(str.get()));
-    return true;
 }
 
 GJS_JSAPI_RETURN_CONVENTION
@@ -1082,7 +1247,9 @@ bool FlagsIn::in(JSContext* cx, GjsFunctionCallState*, GIArgument* arg,
         return false;
 
     if ((uint64_t(number) & m_mask) != uint64_t(number)) {
-        gjs_throw(cx, "%" PRId64 " is not a valid value for flags argument %s",
+        gjs_throw(cx,
+                  "0x%" G_GINT64_MODIFIER
+                  "x is not a valid value for flags argument %s",
                   number, m_arg_name);
         return false;
     }
@@ -1097,7 +1264,7 @@ bool FlagsIn::in(JSContext* cx, GjsFunctionCallState*, GIArgument* arg,
 GJS_JSAPI_RETURN_CONVENTION
 bool ForeignStructInstanceIn::in(JSContext* cx, GjsFunctionCallState*,
                                  GIArgument* arg, JS::HandleValue value) {
-    return gjs_struct_foreign_convert_to_g_argument(
+    return gjs_struct_foreign_convert_to_gi_argument(
         cx, value, m_info, m_arg_name, GJS_ARGUMENT_ARGUMENT, m_transfer,
         flags(), arg);
 }
@@ -1179,8 +1346,8 @@ bool GClosureInTransferNone::in(JSContext* cx, GjsFunctionCallState* state,
         return report_typeof_mismatch(cx, m_arg_name, value,
                                       ExpectedType::FUNCTION);
 
-    JS::RootedFunction func(cx, JS_GetObjectFunction(&value.toObject()));
-    GClosure* closure = Gjs::Closure::create_marshaled(cx, func, "boxed");
+    JS::RootedObject callable(cx, &value.toObject());
+    GClosure* closure = Gjs::Closure::create_marshaled(cx, callable, "boxed");
     gjs_arg_set(arg, closure);
     g_closure_ref(closure);
     g_closure_sink(closure);
@@ -1199,6 +1366,7 @@ bool GBytesIn::in(JSContext* cx, GjsFunctionCallState* state, GIArgument* arg,
 
     JS::RootedObject object(cx, &value.toObject());
     if (JS_IsUint8Array(object)) {
+        state->ignore_release.insert(arg);
         gjs_arg_set(arg, gjs_byte_array_get_bytes(object));
         return true;
     }
@@ -1207,6 +1375,15 @@ bool GBytesIn::in(JSContext* cx, GjsFunctionCallState* state, GIArgument* arg,
     // ownership, so we need to do the same here.
     return BoxedBase::transfer_to_gi_argument(
         cx, object, arg, GI_DIRECTION_IN, GI_TRANSFER_EVERYTHING, G_TYPE_BYTES);
+}
+
+GJS_JSAPI_RETURN_CONVENTION
+bool GBytesIn::release(JSContext* cx, GjsFunctionCallState* state,
+                       GIArgument* in_arg, GIArgument* out_arg) {
+    if (state->ignore_release.erase(in_arg))
+        return BoxedIn::release(cx, state, in_arg, out_arg);
+
+    return BoxedInTransferNone::release(cx, state, in_arg, out_arg);
 }
 
 GJS_JSAPI_RETURN_CONVENTION
@@ -1320,16 +1497,23 @@ bool ParamInstanceIn::in(JSContext* cx, GjsFunctionCallState*, GIArgument* arg,
 GJS_JSAPI_RETURN_CONVENTION
 bool GenericInOut::out(JSContext* cx, GjsFunctionCallState*, GIArgument* arg,
                        JS::MutableHandleValue value) {
-    return gjs_value_from_g_argument(cx, value, &m_type_info, arg, true);
+    return gjs_value_from_gi_argument(cx, value, &m_type_info, arg, true);
 }
 
 GJS_JSAPI_RETURN_CONVENTION
 bool ExplicitArrayInOut::out(JSContext* cx, GjsFunctionCallState* state,
                              GIArgument* arg, JS::MutableHandleValue value) {
-    GIArgument* length_arg = &(state->out_cvalue(m_length_pos));
-    size_t length = gjs_g_argument_get_array_length(m_tag, length_arg);
+    GIArgument* length_arg;
 
-    return gjs_value_from_explicit_array(cx, value, &m_type_info, arg, length);
+    if (m_length_direction != GI_DIRECTION_IN)
+        length_arg = &(state->out_cvalue(m_length_pos));
+    else
+        length_arg = &(state->in_cvalue(m_length_pos));
+
+    size_t length = gjs_gi_argument_get_array_length(m_tag, length_arg);
+
+    return gjs_value_from_explicit_array(cx, value, &m_type_info, m_transfer,
+                                         arg, length);
 }
 
 GJS_JSAPI_RETURN_CONVENTION
@@ -1337,14 +1521,14 @@ bool GenericIn::release(JSContext* cx, GjsFunctionCallState* state,
                         GIArgument* in_arg, GIArgument*) {
     GITransfer transfer =
         state->call_completed() ? m_transfer : GI_TRANSFER_NOTHING;
-    return gjs_g_argument_release_in_arg(cx, transfer, &m_type_info, in_arg);
+    return gjs_gi_argument_release_in_arg(cx, transfer, &m_type_info, in_arg);
 }
 
 GJS_JSAPI_RETURN_CONVENTION
 bool GenericOut::release(JSContext* cx, GjsFunctionCallState*,
                          GIArgument* in_arg [[maybe_unused]],
                          GIArgument* out_arg) {
-    return gjs_g_argument_release(cx, m_transfer, &m_type_info, out_arg);
+    return gjs_gi_argument_release(cx, m_transfer, &m_type_info, out_arg);
 }
 
 GJS_JSAPI_RETURN_CONVENTION
@@ -1355,11 +1539,11 @@ bool GenericInOut::release(JSContext* cx, GjsFunctionCallState* state,
     // freeing it.
 
     GIArgument* original_out_arg = &state->inout_original_cvalue(m_arg_pos);
-    if (!gjs_g_argument_release_in_arg(cx, GI_TRANSFER_NOTHING, &m_type_info,
-                                       original_out_arg))
+    if (!gjs_gi_argument_release_in_arg(cx, GI_TRANSFER_NOTHING, &m_type_info,
+                                        original_out_arg))
         return false;
 
-    return gjs_g_argument_release(cx, m_transfer, &m_type_info, out_arg);
+    return gjs_gi_argument_release(cx, m_transfer, &m_type_info, out_arg);
 }
 
 GJS_JSAPI_RETURN_CONVENTION
@@ -1367,10 +1551,10 @@ bool ExplicitArrayOut::release(JSContext* cx, GjsFunctionCallState* state,
                                GIArgument* in_arg [[maybe_unused]],
                                GIArgument* out_arg) {
     GIArgument* length_arg = &state->out_cvalue(m_length_pos);
-    size_t length = gjs_g_argument_get_array_length(m_tag, length_arg);
+    size_t length = gjs_gi_argument_get_array_length(m_tag, length_arg);
 
-    return gjs_g_argument_release_out_array(cx, m_transfer, &m_type_info,
-                                            length, out_arg);
+    return gjs_gi_argument_release_out_array(cx, m_transfer, &m_type_info,
+                                             length, out_arg);
 }
 
 GJS_JSAPI_RETURN_CONVENTION
@@ -1378,34 +1562,42 @@ bool ExplicitArrayIn::release(JSContext* cx, GjsFunctionCallState* state,
                               GIArgument* in_arg,
                               GIArgument* out_arg [[maybe_unused]]) {
     GIArgument* length_arg = &state->in_cvalue(m_length_pos);
-    size_t length = gjs_g_argument_get_array_length(m_tag, length_arg);
+    size_t length = gjs_gi_argument_get_array_length(m_tag, length_arg);
 
     GITransfer transfer =
         state->call_completed() ? m_transfer : GI_TRANSFER_NOTHING;
 
-    return gjs_g_argument_release_in_array(cx, transfer, &m_type_info, length,
-                                           in_arg);
+    return gjs_gi_argument_release_in_array(cx, transfer, &m_type_info, length,
+                                            in_arg);
 }
 
 GJS_JSAPI_RETURN_CONVENTION
 bool ExplicitArrayInOut::release(JSContext* cx, GjsFunctionCallState* state,
                                  GIArgument* in_arg [[maybe_unused]],
                                  GIArgument* out_arg) {
-    GIArgument* length_arg = &state->in_cvalue(m_length_pos);
-    size_t length = gjs_g_argument_get_array_length(m_tag, length_arg);
+    GIArgument* length_arg = &state->out_cvalue(m_length_pos);
+    size_t length = gjs_gi_argument_get_array_length(m_tag, length_arg);
 
     // For inout, transfer refers to what we get back from the function; for
     // the temporary C value we allocated, clearly we're responsible for
     // freeing it.
 
     GIArgument* original_out_arg = &state->inout_original_cvalue(m_arg_pos);
-    if (gjs_arg_get<void*>(original_out_arg) != gjs_arg_get<void*>(out_arg) &&
-        !gjs_g_argument_release_in_array(cx, GI_TRANSFER_NOTHING, &m_type_info,
-                                         length, original_out_arg))
-        return false;
+    // Due to https://gitlab.gnome.org/GNOME/gobject-introspection/-/issues/192
+    // Here we've to guess what to do, but in general is "better" to leak than
+    // crash, so let's assume that in/out transfer is matching.
+    if (gjs_arg_get<void*>(original_out_arg) != gjs_arg_get<void*>(out_arg)) {
+        GITransfer transfer =
+            state->call_completed() ? m_transfer : GI_TRANSFER_NOTHING;
+        if (!gjs_gi_argument_release_in_array(cx, transfer, &m_type_info,
+                                              length, original_out_arg))
+            return false;
+    }
 
-    return gjs_g_argument_release_out_array(cx, m_transfer, &m_type_info,
-                                            length, out_arg);
+    GITransfer transfer =
+        state->call_completed() ? m_transfer : GI_TRANSFER_NOTHING;
+    return gjs_gi_argument_release_out_array(cx, transfer, &m_type_info, length,
+                                             out_arg);
 }
 
 GJS_JSAPI_RETURN_CONVENTION
@@ -1413,6 +1605,13 @@ bool CallerAllocatesOut::release(JSContext*, GjsFunctionCallState*,
                                  GIArgument* in_arg,
                                  GIArgument* out_arg [[maybe_unused]]) {
     g_free(gjs_arg_steal<void*>(in_arg));
+    return true;
+}
+
+GJS_JSAPI_RETURN_CONVENTION
+bool BoxedCallerAllocatesOut::release(JSContext*, GjsFunctionCallState*,
+                                      GIArgument* in_arg, GIArgument*) {
+    g_boxed_free(m_gtype, gjs_arg_steal<void*>(in_arg));
     return true;
 }
 
@@ -1431,10 +1630,10 @@ bool CallbackIn::release(JSContext*, GjsFunctionCallState*, GIArgument* in_arg,
     return true;
 }
 
-GJS_JSAPI_RETURN_CONVENTION
-bool StringInTransferNone::release(JSContext*, GjsFunctionCallState*,
-                                   GIArgument* in_arg,
-                                   GIArgument* out_arg [[maybe_unused]]) {
+template <GITypeTag TAG>
+GJS_JSAPI_RETURN_CONVENTION bool StringInTransferNone<TAG>::release(
+    JSContext*, GjsFunctionCallState*, GIArgument* in_arg,
+    GIArgument* out_arg [[maybe_unused]]) {
     g_free(gjs_arg_get<void*>(in_arg));
     return true;
 }
@@ -1447,8 +1646,8 @@ bool ForeignStructIn::release(JSContext* cx, GjsFunctionCallState* state,
         state->call_completed() ? m_transfer : GI_TRANSFER_NOTHING;
 
     if (transfer == GI_TRANSFER_NOTHING)
-        return gjs_struct_foreign_release_g_argument(cx, m_transfer, m_info,
-                                                     in_arg);
+        return gjs_struct_foreign_release_gi_argument(cx, m_transfer, m_info,
+                                                      in_arg);
 
     return true;
 }
@@ -1506,7 +1705,7 @@ bool Argument::release(JSContext*, GjsFunctionCallState*, GIArgument*,
 #ifdef GJS_DO_ARGUMENTS_SIZE_CHECK
 template <typename T>
 constexpr size_t argument_maximum_size() {
-    if constexpr (std::is_same_v<T, Arg::NumericIn>)
+    if constexpr (std::is_same_v<T, Arg::NumericIn<int>>)
         return 24;
     if constexpr (std::is_same_v<T, Arg::ObjectIn> ||
                   std::is_same_v<T, Arg::BoxedIn>)
@@ -1517,16 +1716,16 @@ constexpr size_t argument_maximum_size() {
 #endif
 
 template <typename T, Arg::Kind ArgKind, typename... Args>
-std::unique_ptr<T> Argument::make(uint8_t index, const char* name,
-                                  GITypeInfo* type_info, GITransfer transfer,
-                                  GjsArgumentFlags flags, Args&&... args) {
+GjsAutoCppPointer<T> Argument::make(uint8_t index, const char* name,
+                                    GITypeInfo* type_info, GITransfer transfer,
+                                    GjsArgumentFlags flags, Args&&... args) {
 #ifdef GJS_DO_ARGUMENTS_SIZE_CHECK
     static_assert(
         sizeof(T) <= argument_maximum_size<T>(),
         "Think very hard before increasing the size of Gjs::Arguments. "
         "One is allocated for every argument to every introspected function.");
 #endif
-    auto arg = std::make_unique<T>(args...);
+    auto arg = new T(args...);
 
     if constexpr (ArgKind == Arg::Kind::INSTANCE) {
         g_assert(index == Argument::ABSENT &&
@@ -1562,10 +1761,6 @@ std::unique_ptr<T> Argument::make(uint8_t index, const char* name,
     return arg;
 }
 
-//  Needed for unique_ptr with incomplete type
-ArgsCache::ArgsCache() = default;
-ArgsCache::~ArgsCache() = default;
-
 bool ArgsCache::initialize(JSContext* cx, GICallableInfo* callable) {
     if (!callable) {
         gjs_throw(cx, "Invalid callable provided");
@@ -1596,38 +1791,35 @@ bool ArgsCache::initialize(JSContext* cx, GICallableInfo* callable) {
         return false;
     }
 
-    m_args = std::make_unique<Argument::UniquePtr[]>(size);
+    m_args = new ArgumentPtr[size]{};
     return true;
 }
 
-void ArgsCache::clear() {
-    m_args.reset();
-}
-
 template <typename T, Arg::Kind ArgKind, typename... Args>
-T* ArgsCache::set_argument(uint8_t index, const char* name,
-                           GITypeInfo* type_info, GITransfer transfer,
-                           GjsArgumentFlags flags, Args&&... args) {
-    std::unique_ptr<T> arg = Argument::make<T, ArgKind>(
+constexpr T* ArgsCache::set_argument(uint8_t index, const char* name,
+                                     GITypeInfo* type_info, GITransfer transfer,
+                                     GjsArgumentFlags flags, Args&&... args) {
+    GjsAutoCppPointer<T> arg = Argument::make<T, ArgKind>(
         index, name, type_info, transfer, flags, args...);
-    arg_get<ArgKind>(index) = std::move(arg);
+    arg_get<ArgKind>(index) = arg.release();
     return static_cast<T*>(arg_get<ArgKind>(index).get());
 }
 
 template <typename T, Arg::Kind ArgKind, typename... Args>
-T* ArgsCache::set_argument(uint8_t index, const char* name, GITransfer transfer,
-                           GjsArgumentFlags flags, Args&&... args) {
+constexpr T* ArgsCache::set_argument(uint8_t index, const char* name,
+                                     GITransfer transfer,
+                                     GjsArgumentFlags flags, Args&&... args) {
     return set_argument<T, ArgKind>(index, name, nullptr, transfer, flags,
                                     args...);
 }
 
 template <typename T, Arg::Kind ArgKind, typename... Args>
-T* ArgsCache::set_argument_auto(Args&&... args) {
+constexpr T* ArgsCache::set_argument_auto(Args&&... args) {
     return set_argument<T, ArgKind>(std::forward<Args>(args)...);
 }
 
 template <typename T, Arg::Kind ArgKind, typename Tuple, typename... Args>
-T* ArgsCache::set_argument_auto(Tuple&& tuple, Args&&... args) {
+constexpr T* ArgsCache::set_argument_auto(Tuple&& tuple, Args&&... args) {
     // TODO(3v1n0): Would be nice to have a simple way to check we're handling a
     // tuple
     return std::apply(
@@ -1639,23 +1831,17 @@ T* ArgsCache::set_argument_auto(Tuple&& tuple, Args&&... args) {
 }
 
 template <typename T>
-T* ArgsCache::set_return(GITypeInfo* type_info, GITransfer transfer,
-                         GjsArgumentFlags flags) {
+constexpr T* ArgsCache::set_return(GITypeInfo* type_info, GITransfer transfer,
+                                   GjsArgumentFlags flags) {
     return set_argument<T, Arg::Kind::RETURN_VALUE>(Argument::ABSENT, nullptr,
                                                     type_info, transfer, flags);
 }
 
 template <typename T>
-T* ArgsCache::set_instance(GITransfer transfer, GjsArgumentFlags flags) {
+constexpr T* ArgsCache::set_instance(GITransfer transfer,
+                                     GjsArgumentFlags flags) {
     return set_argument<T, Arg::Kind::INSTANCE>(Argument::ABSENT, nullptr,
                                                 transfer, flags);
-}
-
-Argument* ArgsCache::instance() const {
-    if (!m_is_method)
-        return nullptr;
-
-    return arg_get<Arg::Kind::INSTANCE>().get();
 }
 
 GType ArgsCache::instance_type() const {
@@ -1665,11 +1851,12 @@ GType ArgsCache::instance_type() const {
     return instance()->as_instance()->gtype();
 }
 
-Argument* ArgsCache::return_value() const {
-    if (!m_has_return)
-        return nullptr;
+GITypeTag ArgsCache::return_tag() const {
+    Argument* rval = return_value();
+    if (!rval)
+        return GI_TYPE_TAG_VOID;
 
-    return arg_get<Arg::Kind::RETURN_VALUE>().get();
+    return rval->return_tag();
 }
 
 GITypeInfo* ArgsCache::return_type() const {
@@ -1677,10 +1864,10 @@ GITypeInfo* ArgsCache::return_type() const {
     if (!rval)
         return nullptr;
 
-    return const_cast<GITypeInfo*>(rval->as_return_value()->type_info());
+    return const_cast<GITypeInfo*>(rval->return_type());
 }
 
-void ArgsCache::set_skip_all(uint8_t index, const char* name) {
+constexpr void ArgsCache::set_skip_all(uint8_t index, const char* name) {
     set_argument<Arg::SkipAll>(index, name, GI_TRANSFER_NOTHING,
                                GjsArgumentFlags::SKIP_ALL);
 }
@@ -1726,7 +1913,8 @@ void ArgsCache::set_array_argument(GICallableInfo* callable, uint8_t gi_index,
             static_cast<GjsArgumentFlags>(flags | GjsArgumentFlags::SKIP_ALL));
     }
 
-    array->set_array_length(length_pos, g_type_info_get_tag(&length_type));
+    array->set_array_length(length_pos, g_type_info_get_tag(&length_type),
+                            g_arg_info_get_direction(&length_arg));
 }
 
 void ArgsCache::build_return(GICallableInfo* callable, bool* inc_counter_out) {
@@ -1745,14 +1933,89 @@ void ArgsCache::build_return(GICallableInfo* callable, bool* inc_counter_out) {
     *inc_counter_out = true;
     GjsArgumentFlags flags = GjsArgumentFlags::SKIP_IN;
 
-    if (tag == GI_TYPE_TAG_ARRAY) {
-        int length_pos = g_type_info_get_array_length(&type_info);
-        if (length_pos >= 0) {
-            set_array_argument<Arg::Kind::RETURN_VALUE>(
-                callable, 0, &type_info, GI_DIRECTION_OUT, nullptr, flags,
-                length_pos);
+    if (g_callable_info_may_return_null(callable))
+        flags |= GjsArgumentFlags::MAY_BE_NULL;
+
+    switch (tag) {
+        case GI_TYPE_TAG_BOOLEAN:
+            set_return<Arg::BooleanReturn>(&type_info, transfer, flags);
             return;
+
+        case GI_TYPE_TAG_INT8:
+            set_return<Arg::NumericReturn<int8_t, GI_TYPE_TAG_INT8>>(
+                &type_info, transfer, flags);
+            return;
+
+        case GI_TYPE_TAG_INT16:
+            set_return<Arg::NumericReturn<int16_t, GI_TYPE_TAG_INT16>>(
+                &type_info, transfer, flags);
+            return;
+
+        case GI_TYPE_TAG_INT32:
+            set_return<Arg::NumericReturn<int32_t, GI_TYPE_TAG_INT32>>(
+                &type_info, transfer, flags);
+            return;
+
+        case GI_TYPE_TAG_UINT8:
+            set_return<Arg::NumericReturn<uint8_t, GI_TYPE_TAG_UINT8>>(
+                &type_info, transfer, flags);
+            return;
+
+        case GI_TYPE_TAG_UINT16:
+            set_return<Arg::NumericReturn<uint16_t, GI_TYPE_TAG_UINT16>>(
+                &type_info, transfer, flags);
+            return;
+
+        case GI_TYPE_TAG_UINT32:
+            set_return<Arg::NumericReturn<uint32_t, GI_TYPE_TAG_UINT32>>(
+                &type_info, transfer, flags);
+            return;
+
+        case GI_TYPE_TAG_INT64:
+            set_return<Arg::NumericReturn<int64_t, GI_TYPE_TAG_INT64>>(
+                &type_info, transfer, flags);
+            return;
+
+        case GI_TYPE_TAG_UINT64:
+            set_return<Arg::NumericReturn<uint64_t, GI_TYPE_TAG_UINT64>>(
+                &type_info, transfer, flags);
+            return;
+
+        case GI_TYPE_TAG_FLOAT:
+            set_return<Arg::NumericReturn<float, GI_TYPE_TAG_FLOAT>>(
+                &type_info, transfer, flags);
+            return;
+
+        case GI_TYPE_TAG_DOUBLE:
+            set_return<Arg::NumericReturn<double, GI_TYPE_TAG_DOUBLE>>(
+                &type_info, transfer, flags);
+            return;
+
+        case GI_TYPE_TAG_UTF8:
+            if (transfer == GI_TRANSFER_NOTHING) {
+                set_return<Arg::StringReturn<GI_TRANSFER_NOTHING>>(
+                    &type_info, transfer, flags);
+                return;
+            } else {
+                set_return<Arg::StringReturn<GI_TRANSFER_EVERYTHING>>(
+                    &type_info, transfer, flags);
+                return;
+            }
+
+        case GI_TYPE_TAG_ARRAY: {
+            int length_pos = g_type_info_get_array_length(&type_info);
+            if (length_pos >= 0) {
+                set_array_argument<Arg::Kind::RETURN_VALUE>(
+                    callable, 0, &type_info, GI_DIRECTION_OUT, nullptr, flags,
+                    length_pos);
+                return;
+            }
+
+            [[fallthrough]];
         }
+
+        default:
+            break;
     }
 
     // in() is ignored for the return value, but skip_in is not (it is used
@@ -2012,17 +2275,44 @@ void ArgsCache::build_normal_in_arg(uint8_t gi_index, GITypeInfo* type_info,
             break;
 
         case GI_TYPE_TAG_INT8:
+            set_argument_auto<Arg::NumericIn<int8_t>>(common_args);
+            return;
+
         case GI_TYPE_TAG_INT16:
+            set_argument_auto<Arg::NumericIn<int16_t>>(common_args);
+            return;
+
         case GI_TYPE_TAG_INT32:
+            set_argument_auto<Arg::NumericIn<int32_t>>(common_args);
+            return;
+
         case GI_TYPE_TAG_UINT8:
+            set_argument_auto<Arg::NumericIn<uint8_t>>(common_args);
+            return;
+
         case GI_TYPE_TAG_UINT16:
+            set_argument_auto<Arg::NumericIn<uint16_t>>(common_args);
+            return;
+
         case GI_TYPE_TAG_UINT32:
+            set_argument_auto<Arg::NumericIn<uint32_t>>(common_args);
+            return;
+
         case GI_TYPE_TAG_INT64:
+            set_argument_auto<Arg::NumericIn<int64_t>>(common_args);
+            return;
+
         case GI_TYPE_TAG_UINT64:
+            set_argument_auto<Arg::NumericIn<uint64_t>>(common_args);
+            return;
+
         case GI_TYPE_TAG_FLOAT:
+            set_argument_auto<Arg::NumericIn<float>>(common_args);
+            return;
+
         case GI_TYPE_TAG_DOUBLE:
-            set_argument_auto<Arg::NumericIn>(common_args, tag);
-            break;
+            set_argument_auto<Arg::NumericIn<double>>(common_args);
+            return;
 
         case GI_TYPE_TAG_UNICHAR:
             set_argument_auto<Arg::UnicharIn>(common_args);
@@ -2041,7 +2331,8 @@ void ArgsCache::build_normal_in_arg(uint8_t gi_index, GITypeInfo* type_info,
 
         case GI_TYPE_TAG_UTF8:
             if (transfer == GI_TRANSFER_NOTHING)
-                set_argument_auto<Arg::StringInTransferNone>(common_args);
+                set_argument_auto<Arg::StringInTransferNone<GI_TYPE_TAG_UTF8>>(
+                    common_args);
             else
                 set_argument_auto<Arg::StringIn>(common_args);
             break;
@@ -2062,6 +2353,132 @@ void ArgsCache::build_normal_in_arg(uint8_t gi_index, GITypeInfo* type_info,
         default:
             // FIXME: Falling back to the generic marshaller
             set_argument_auto<Arg::FallbackIn>(common_args);
+    }
+}
+
+void ArgsCache::build_normal_out_arg(uint8_t gi_index, GITypeInfo* type_info,
+                                     GIArgInfo* arg, GjsArgumentFlags flags) {
+    const char* name = g_base_info_get_name(arg);
+    GITransfer transfer = g_arg_info_get_ownership_transfer(arg);
+    auto common_args =
+        std::make_tuple(gi_index, name, type_info, transfer, flags);
+    GITypeTag tag = g_type_info_get_tag(type_info);
+
+    switch (tag) {
+        case GI_TYPE_TAG_BOOLEAN:
+            set_argument_auto<Arg::BooleanOut>(common_args);
+            break;
+
+        case GI_TYPE_TAG_INT8:
+            set_argument_auto<Arg::NumericOut<int8_t>>(common_args);
+            return;
+
+        case GI_TYPE_TAG_INT16:
+            set_argument_auto<Arg::NumericOut<int16_t>>(common_args);
+            return;
+
+        case GI_TYPE_TAG_INT32:
+            set_argument_auto<Arg::NumericOut<int32_t>>(common_args);
+            return;
+
+        case GI_TYPE_TAG_UINT8:
+            set_argument_auto<Arg::NumericOut<uint8_t>>(common_args);
+            return;
+
+        case GI_TYPE_TAG_UINT16:
+            set_argument_auto<Arg::NumericOut<uint16_t>>(common_args);
+            return;
+
+        case GI_TYPE_TAG_UINT32:
+            set_argument_auto<Arg::NumericOut<uint32_t>>(common_args);
+            return;
+
+        case GI_TYPE_TAG_INT64:
+            set_argument_auto<Arg::NumericOut<int64_t>>(common_args);
+            return;
+
+        case GI_TYPE_TAG_UINT64:
+            set_argument_auto<Arg::NumericOut<uint64_t>>(common_args);
+            return;
+
+        case GI_TYPE_TAG_FLOAT:
+            set_argument_auto<Arg::NumericOut<float>>(common_args);
+            return;
+
+        case GI_TYPE_TAG_DOUBLE:
+            set_argument_auto<Arg::NumericOut<double>>(common_args);
+            return;
+
+        case GI_TYPE_TAG_UTF8:
+            if (transfer == GI_TRANSFER_NOTHING) {
+                set_argument_auto<Arg::StringOut<GI_TRANSFER_NOTHING>>(
+                    common_args);
+            } else {
+                set_argument_auto<Arg::StringOut<GI_TRANSFER_EVERYTHING>>(
+                    common_args);
+            }
+            return;
+
+        default:
+            set_argument_auto<Arg::FallbackOut>(common_args);
+    }
+}
+
+void ArgsCache::build_normal_inout_arg(uint8_t gi_index, GITypeInfo* type_info,
+                                       GIArgInfo* arg, GjsArgumentFlags flags) {
+    const char* name = g_base_info_get_name(arg);
+    GITransfer transfer = g_arg_info_get_ownership_transfer(arg);
+    auto common_args =
+        std::make_tuple(gi_index, name, type_info, transfer, flags);
+    GITypeTag tag = g_type_info_get_tag(type_info);
+
+    switch (tag) {
+        case GI_TYPE_TAG_BOOLEAN:
+            set_argument_auto<Arg::BooleanInOut>(common_args);
+            break;
+
+        case GI_TYPE_TAG_INT8:
+            set_argument_auto<Arg::NumericInOut<int8_t>>(common_args);
+            return;
+
+        case GI_TYPE_TAG_INT16:
+            set_argument_auto<Arg::NumericInOut<int16_t>>(common_args);
+            return;
+
+        case GI_TYPE_TAG_INT32:
+            set_argument_auto<Arg::NumericInOut<int32_t>>(common_args);
+            return;
+
+        case GI_TYPE_TAG_UINT8:
+            set_argument_auto<Arg::NumericInOut<uint8_t>>(common_args);
+            return;
+
+        case GI_TYPE_TAG_UINT16:
+            set_argument_auto<Arg::NumericInOut<uint16_t>>(common_args);
+            return;
+
+        case GI_TYPE_TAG_UINT32:
+            set_argument_auto<Arg::NumericInOut<uint32_t>>(common_args);
+            return;
+
+        case GI_TYPE_TAG_INT64:
+            set_argument_auto<Arg::NumericInOut<int64_t>>(common_args);
+            return;
+
+        case GI_TYPE_TAG_UINT64:
+            set_argument_auto<Arg::NumericInOut<uint64_t>>(common_args);
+            return;
+
+        case GI_TYPE_TAG_FLOAT:
+            set_argument_auto<Arg::NumericInOut<float>>(common_args);
+            return;
+
+        case GI_TYPE_TAG_DOUBLE:
+            set_argument_auto<Arg::NumericInOut<double>>(common_args);
+            return;
+
+        default:
+            set_argument_auto<Arg::FallbackInOut>(common_args);
     }
 }
 
@@ -2099,6 +2516,11 @@ void ArgsCache::build_instance(GICallableInfo* callable) {
         GjsArgumentFlags::NONE);
 }
 
+static constexpr bool type_tag_is_scalar(GITypeTag tag) {
+    return GI_TYPE_TAG_IS_NUMERIC(tag) || tag == GI_TYPE_TAG_BOOLEAN ||
+           tag == GI_TYPE_TAG_GTYPE;
+}
+
 void ArgsCache::build_arg(uint8_t gi_index, GIDirection direction,
                           GIArgInfo* arg, GICallableInfo* callable,
                           bool* inc_counter_out) {
@@ -2127,26 +2549,54 @@ void ArgsCache::build_arg(uint8_t gi_index, GIDirection direction,
     GITypeTag type_tag = g_type_info_get_tag(&type_info);
     if (direction == GI_DIRECTION_OUT &&
         (flags & GjsArgumentFlags::CALLER_ALLOCATES)) {
-        if (type_tag != GI_TYPE_TAG_INTERFACE) {
+        size_t size = 0;
+
+        if (type_tag == GI_TYPE_TAG_ARRAY) {
+            GIArrayType array_type = g_type_info_get_array_type(&type_info);
+
+            switch (array_type) {
+                case GI_ARRAY_TYPE_C: {
+                    GjsAutoTypeInfo param_info;
+                    int n_elements =
+                        g_type_info_get_array_fixed_size(&type_info);
+
+                    if (n_elements <= 0)
+                        break;
+
+                    param_info = g_type_info_get_param_type(&type_info, 0);
+                    GITypeTag param_tag = g_type_info_get_tag(param_info);
+
+                    size = gjs_type_get_element_size(param_tag, param_info);
+                    size *= n_elements;
+                    break;
+                }
+                default:
+                    break;
+            }
+        } else if (!type_tag_is_scalar(type_tag) &&
+                   !g_type_info_is_pointer(&type_info)) {
+            // Scalar out parameters should not be annotated with
+            // caller-allocates, which is for structured types that need to be
+            // allocated in order for the function to fill them in.
+            size = gjs_type_get_element_size(type_tag, &type_info);
+        }
+
+        if (!size) {
             set_argument_auto<Arg::NotIntrospectable>(
                 common_args, OUT_CALLER_ALLOCATES_NON_STRUCT);
             return;
         }
 
-        GjsAutoBaseInfo interface_info = g_type_info_get_interface(&type_info);
-        g_assert(interface_info);
-
-        GIInfoType interface_type = g_base_info_get_type(interface_info);
-
-        size_t size;
-        if (interface_type == GI_INFO_TYPE_STRUCT) {
-            size = g_struct_info_get_size(interface_info);
-        } else if (interface_type == GI_INFO_TYPE_UNION) {
-            size = g_union_info_get_size(interface_info);
-        } else {
-            set_argument_auto<Arg::NotIntrospectable>(
-                common_args, OUT_CALLER_ALLOCATES_NON_STRUCT);
-            return;
+        if (type_tag == GI_TYPE_TAG_INTERFACE) {
+            GjsAutoBaseInfo interface_info =
+                g_type_info_get_interface(&type_info);
+            GType gtype = g_registered_type_info_get_g_type(interface_info);
+            if (g_type_is_a(gtype, G_TYPE_BOXED)) {
+                auto* gjs_arg = set_argument_auto<Arg::BoxedCallerAllocatesOut>(
+                    common_args, gtype);
+                gjs_arg->m_allocates_size = size;
+                return;
+            }
         }
 
         auto* gjs_arg = set_argument_auto<Arg::CallerAllocatesOut>(common_args);
@@ -2222,15 +2672,31 @@ void ArgsCache::build_arg(uint8_t gi_index, GIDirection direction,
             }
 
             return;
+        } else if (g_type_info_is_zero_terminated(&type_info)) {
+            if (direction == GI_DIRECTION_IN) {
+                set_argument_auto<Arg::ZeroTerminatedArrayIn>(common_args);
+                return;
+            } else if (direction == GI_DIRECTION_INOUT) {
+                set_argument_auto<Arg::ZeroTerminatedArrayInOut>(common_args);
+                return;
+            }
+        } else if (g_type_info_get_array_fixed_size(&type_info) >= 0) {
+            if (direction == GI_DIRECTION_IN) {
+                set_argument_auto<Arg::FixedSizeArrayIn>(common_args);
+                return;
+            } else if (direction == GI_DIRECTION_INOUT) {
+                set_argument_auto<Arg::FixedSizeArrayInOut>(common_args);
+                return;
+            }
         }
     }
 
     if (direction == GI_DIRECTION_IN)
         build_normal_in_arg(gi_index, &type_info, arg, flags);
     else if (direction == GI_DIRECTION_INOUT)
-        set_argument_auto<Arg::FallbackInOut>(common_args);
+        build_normal_inout_arg(gi_index, &type_info, arg, flags);
     else
-        set_argument_auto<Arg::FallbackOut>(common_args);
+        build_normal_out_arg(gi_index, &type_info, arg, flags);
 
     return;
 }
